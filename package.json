@@ -1,0 +1,28 @@
+{
+  "name": "wina-classic-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp Cloud API chatbot backend for Wina Classic Uganda, powered by Gemini.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "create-admin": "node scripts/create-admin.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "whatsapp",
+    "gemini",
+    "chatbot",
+    "wina-classic"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@google/genai": "^2.24.0",
+    "axios": "^1.20.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.3",
+    "mysql2": "^3.9.0"
+  }
+}

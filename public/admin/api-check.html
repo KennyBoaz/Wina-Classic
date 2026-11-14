@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Shop Desk - API check</title>
+  <style>
+    body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 960px; margin: 18px auto; padding: 0 12px; color: #1d1d1b; background: #f7f4ee; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    p.note { margin: 0 0 14px; color: #6b675f; }
+    fieldset { border: 1px solid #d9d3c5; background: #fff; margin: 0 0 12px; padding: 10px 12px; }
+    legend { font-weight: 600; padding: 0 6px; }
+    input, textarea, select { font: inherit; padding: 6px 8px; border: 1px solid #c9c2b2; border-radius: 3px; margin: 2px 4px 2px 0; }
+    input[type=text], input[type=email], input[type=password] { width: 230px; }
+    textarea { width: 100%; box-sizing: border-box; }
+    button { font: inherit; padding: 6px 12px; border: 0; background: #1d1d1b; color: #fff; border-radius: 3px; cursor: pointer; margin: 2px 4px 2px 0; }
+    button.alt { background: #8a6d2f; }
+    #chats button { background: #fff; color: #1d1d1b; border: 1px solid #c9c2b2; }
+    pre { background: #1d1d1b; color: #e8e2d2; padding: 10px; overflow: auto; max-height: 460px; border-radius: 3px; white-space: pre-wrap; word-break: break-word; }
+    .hidden { display: none; }
+    #who { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Shop Desk - API check</h1>
+  <p class="note">A temporary test page for Phase 2. The real dashboard replaces it in Phase 3.</p>
+
+  <fieldset id="setupBox" class="hidden">
+    <legend>First-time setup (create the first admin)</legend>
+    <input id="setupToken" type="password" placeholder="SETUP_TOKEN from .env" autocomplete="off">
+    <input id="setupName" type="text" placeholder="Your full name">
+    <input id="setupEmail" type="email" placeholder="Email">
+    <input id="setupPassword" type="password" placeholder="Password (10+ characters)" autocomplete="new-password">
+    <button id="setupBtn">Create admin</button>
+  </fieldset>
+
+  <fieldset id="loginBox">
+    <legend>Log in</legend>
+    <input id="email" type="email" placeholder="Email" autocomplete="username">
+    <input id="password" type="password" placeholder="Password" autocomplete="current-password">
+    <button id="loginBtn">Log in</button>
+  </fieldset>
+
+  <div id="tools" class="hidden">
+    <p>Logged in as <span id="who"></span> <button id="logoutBtn" class="alt">Log out</button></p>
+
+    <fieldset>
+      <legend>Overview</legend>
+      <button data-get="/summary">Summary</button>
+      <button data-get="/conversations?filter=active">Active chats</button>
+      <button data-get="/conversations?filter=escalated">Escalated</button>
+      <button data-get="/conversations?filter=human">Human mode</button>
+      <button data-get="/issues">Open issues</button>
+      <button data-get="/orders">Open orders</button>
+      <button data-get="/appointments">Open appointments</button>
+      <button data-get="/staff">Staff (admin)</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>Open a chat</legend>
+      <div id="chats"></div>
+      <p>Chat: <b id="current">none selected</b></p>
+      <button id="msgsBtn">Show messages</button>
+      <button id="detailBtn">Show details</button>
+      <button id="takeBtn" class="alt">Take over</button>
+      <button id="backBtn" class="alt">Hand back to bot</button>
+      <button id="resolveBtn" class="alt">Resolve</button>
+      <button id="reopenBtn" class="alt">Reopen</button>
+      <textarea id="text" rows="2" placeholder="Type a reply to the customer..."></textarea>
+      <button id="sendBtn">Send reply</button>
+    </fieldset>
+
+    <fieldset>
+      <legend>Update an order / appointment / issue</legend>
+      <select id="kind"><option>issues</option><option>orders</option><option>appointments</option></select>
+      <input id="itemId" type="text" placeholder="id (number)" style="width:90px">
+      <select id="status"><option>in_progress</option><option>resolved</option><option>cancelled</option><option>new</option></select>
+      <input id="note" type="text" placeholder="note (optional)">
+      <button id="itemBtn">Update</button>
+    </fieldset>
+  </div>
+
+  <pre id="out">Ready.</pre>
+  <script src="api-check.js"></script>
+</body>
+</html>
