@@ -16,6 +16,7 @@ const { HttpError } = require("../apiUtil.js");
 const authRoutes = require("./authRoutes.js");
 const chatRoutes = require("./chatRoutes.js");
 const itemRoutes = require("./itemRoutes.js");
+const productRoutes = require("./productRoutes.js");
 const { setupRouter, staffRouter } = require("./staffRoutes.js");
 
 function errorHandler(err, req, res, next) {
@@ -46,6 +47,7 @@ function createApiRouter() {
   router.use(auth.requireAuth);
   router.use(chatRoutes);
   router.use(itemRoutes);
+  router.use(productRoutes);
   router.use("/staff", staffRouter);
 
   router.use((_req, _res, next) => next(new HttpError(404, "Not found.", "NOT_FOUND")));

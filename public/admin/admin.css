@@ -486,3 +486,24 @@ table.table { width: 100%; border-collapse: collapse; }
 .pick .avatar { width: 32px; height: 32px; font-size: 13px; }
 .pick small { margin-left: auto; color: var(--muted); }
 .check { display: flex; align-items: center; gap: 8px; margin: 4px 0 14px; font-size: 13.5px; }
+
+/* ==========================================================================
+   Phase 5: price list, short tab labels
+   ========================================================================== */
+.tab .tl-s { display: none; }
+.head-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.table td.price { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.table td.det { max-width: 260px; }
+.table tr.is-archived td { opacity: .55; }
+.stock-select { width: auto; padding: 5px 8px; font-size: 12.5px; }
+.stock-select.s-in_stock { border-color: #b9dcc8; background: var(--ok-soft); }
+.stock-select.s-low { border-color: #e8d5a4; background: var(--warn-soft); }
+.stock-select.s-out { border-color: #e7bcb9; background: var(--danger-soft); }
+.import-preview { margin-top: 12px; }
+.import-preview .table td, .import-preview .table th { padding: 6px 10px; font-size: 12.5px; }
+.dialog.wide textarea.input { margin-top: 10px; min-height: 90px; }
+@media (max-width: 820px) {
+  .tab .tl { display: none; }
+  .tab .tl-s { display: inline; }
+  .tab { letter-spacing: .04em; }
+}

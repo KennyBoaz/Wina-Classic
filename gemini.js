@@ -36,7 +36,7 @@
 
 const { GoogleGenAI } = require("@google/genai");
 const { SYSTEM_PROMPT } = require("./systemPrompt.js");
-const { functionDeclarations, executeTool } = require("./tools.js");
+const { functionDeclarations, executeTool, describeHours } = require("./tools.js");
 const { toGeminiHistory, fromGeminiHistory } = require("./memory.js");
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.7-flash";
@@ -119,13 +119,34 @@ function orderedModels() {
 // ---------------------------------------------------------------------------
 
 /**
+ * Rules added to your system prompt (they take priority over it). Opening hours come from
+ * BUSINESS_HOURS in .env. Optional .env lines: DELIVERY_INFO, PAYMENT_INFO, RETURNS_INFO.
+ */
+function buildExtraRules() {
+  const lines = [
+    "ADDITIONAL RULES (these take priority over anything above)",
+    `- Opening hours: ${describeHours()} (Africa/Kampala). Use exactly these if a customer asks.`,
+    "- Prices and stock: when a customer asks about a specific item, brand, price or availability, call search_products first and quote ONLY the prices and stock it returns. If nothing is found, never guess: say you will check with the team and call log_inquiry with follow_up_needed true.",
+    "- Appointments: call check_availability for the date before offering times and offer only the slots it returns. Call book_appointment only after the customer confirms a slot. If booking fails, offer the alternative slots it returns. Dates must be YYYY-MM-DD.",
+    "- Interest without an order: when a customer shows interest in a product, occasion, price or visit but is not ordering or booking, call log_inquiry quietly (follow_up_needed true if the team should contact them), then carry on helping. Never mention that you logged it.",
+  ];
+  if (process.env.DELIVERY_INFO) lines.push(`- Delivery: ${process.env.DELIVERY_INFO}`);
+  if (process.env.PAYMENT_INFO) lines.push(`- Payment: ${process.env.PAYMENT_INFO}`);
+  if (process.env.RETURNS_INFO) lines.push(`- Returns and exchanges: ${process.env.RETURNS_INFO}`);
+  return lines.join("\n");
+}
+
+/**
  * Config sent on every chat turn: system prompt, tool schemas, and
  * automaticFunctionCalling disabled so WE run the tool loop (not the SDK).
  */
 function buildChatConfig({ phone, customerName }) {
-  const today = new Date().toISOString().slice(0, 10);
+  // Kampala is UTC+3: using the UTC date would be a day behind after 9pm.
+  const today = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const systemInstruction = [
     SYSTEM_PROMPT,
+    "",
+    buildExtraRules(),
     "",
     `Current customer WhatsApp number: ${phone}`,
     `Current customer profile name: ${customerName || "unknown"}`,

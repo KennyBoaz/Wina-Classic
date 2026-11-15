@@ -9,7 +9,8 @@
     ["chats", "Chats", "chat"],
     ["issues", "Tickets", "ticket"],
     ["orders", "Orders", "box"],
-    ["appointments", "Appointments", "calendar"],
+    ["appointments", "Appointments", "calendar", "Visits"],
+    ["products", "Products", "tag", "Prices"],
     ["staff", "Team", "users"],
   ];
   var BASE_TITLE = "Shop Desk · Wina Classic";
@@ -157,7 +158,7 @@
     R.tabButtons = {};
     var tabBar = h("nav", { class: "tabs", "aria-label": "Sections" }, tabs.map(function (t) {
       var badge = h("span", { class: "badge hidden" });
-      var btn = h("button", { class: "tab", type: "button", onClick: function () { WC.showTab(t[0]); } }, icon(t[2]), h("span", { class: "tl" }, t[1]), badge);
+      var btn = h("button", { class: "tab", type: "button", onClick: function () { WC.showTab(t[0]); } }, icon(t[2]), h("span", { class: "tl" }, t[1]), h("span", { class: "tl-s" }, t[3] || t[1]), badge);
       R.tabButtons[t[0]] = { btn: btn, badge: badge };
       return btn;
     }));
@@ -172,6 +173,7 @@
 
     R.views = { chats: h("div", { class: "view chats-view" }, WC.buildChats()) };
     ["issues", "orders", "appointments"].forEach(function (k) { R.views[k] = h("div", { class: "view" }, WC.buildItems(k)); });
+    R.views.products = h("div", { class: "view" }, WC.buildProducts());
     if (isAdmin) R.views.staff = h("div", { class: "view" }, WC.buildStaff());
     var main = h("main", { class: "main" }, Object.keys(R.views).map(function (k) { return R.views[k]; }));
 
@@ -196,6 +198,7 @@
       if (!S.items[name].loaded) WC.loadItems(name, true); else WC.refreshItems(name);
     }
     if (name === "staff") WC.loadStaff();
+    if (name === "products") WC.loadProducts(true);
     if (name === "chats") WC.refreshChatList();
   };
 
@@ -325,6 +328,7 @@
         var who = it.customer_name || it.chat_name || WC.phone(it.phone);
         if (kind === "orders") notify("New order", (it.items || []).join(", ") + " · " + who, "order-" + it.id, it.phone);
         else if (kind === "appointments") notify("New appointment request", [it.appt_date, it.appt_time].filter(Boolean).join(" ") + " · " + who, "appt-" + it.id, it.phone);
+        else if (it.type === "inquiry") notify("New inquiry", (it.summary || "") + " · " + who, "issue-" + it.id, it.phone);
         else if (it.type !== "escalation") notify("New support ticket", (it.summary || "") + " · " + who, "issue-" + it.id, it.phone);
       });
     });
