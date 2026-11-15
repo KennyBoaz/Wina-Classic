@@ -127,6 +127,12 @@ function parseIncomingMessages(body) {
           type: message.type,
           text: extractText(message),
           timestamp: message.timestamp,
+          // the message this one is a reply to (WhatsApp "quote"), if any
+          replyTo: (message.context && message.context.id) || null,
+          // set when the customer reacted with an emoji to one of our messages
+          reaction: message.type === "reaction"
+            ? { messageId: (message.reaction && message.reaction.message_id) || null, emoji: (message.reaction && message.reaction.emoji) || "" }
+            : null,
         });
       }
     }
@@ -216,7 +222,7 @@ function describeSendError(err) {
  * @returns {Promise<Array<{ text: string, id: string|null, ok: boolean, error: string|null }>>}
  *          one entry per chunk; [] if there was nothing to send
  */
-async function sendWhatsAppText(to, body) {
+async function sendWhatsAppText(to, body, opts = {}) {
   const { token, phoneNumberId } = getConfig();
   const url = `/${GRAPH_API_VERSION}/${phoneNumberId}/messages`;
   const chunks = chunkText(body);
@@ -241,6 +247,8 @@ async function sendWhatsAppText(to, body) {
             to,
             type: "text",
             text: { preview_url: false, body: chunk },
+            // quote an earlier message (only on the first part of a long reply)
+            ...(opts.replyTo && chunk === chunks[0] ? { context: { message_id: opts.replyTo } } : {}),
           },
           { headers: { Authorization: `Bearer ${token}` } }
         );
@@ -351,7 +359,34 @@ function logWhatsAppError(err, to) {
   }
 }
 
+/**
+ * React to a customer's message with an emoji (emoji "" removes our reaction).
+ * WhatsApp refuses reactions to messages older than 30 days or already deleted.
+ * @returns {Promise<{ ok: boolean, id: string|null, error: string|null }>}
+ */
+async function sendWhatsAppReaction(to, messageId, emoji) {
+  const { token, phoneNumberId } = getConfig();
+  try {
+    const response = await graph.post(
+      `/${GRAPH_API_VERSION}/${phoneNumberId}/messages`,
+      {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "reaction",
+        reaction: { message_id: messageId, emoji },
+      },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    return { ok: true, id: (response.data && response.data.messages && response.data.messages[0] && response.data.messages[0].id) || null, error: null };
+  } catch (err) {
+    logWhatsAppError(err, to);
+    return { ok: false, id: null, error: describeSendError(err) };
+  }
+}
+
 module.exports = {
+  sendWhatsAppReaction,
   parseIncomingMessages,
   parseStatusUpdates,
   sendWhatsAppText,

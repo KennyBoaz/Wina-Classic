@@ -295,8 +295,13 @@ async function handleIncomingMessage(message) {
     return;
   }
 
-  // Emoji reactions are not messages we answer or store.
+  // Emoji reactions are not messages we answer: just show them on the message they belong to.
   if (type === "reaction") {
+    if (message.reaction && message.reaction.messageId) {
+      chatStore
+        .setCustomerReaction(message.reaction.messageId, message.reaction.emoji)
+        .catch((err) => console.error("[db] Could not save a reaction:", err.message));
+    }
     return;
   }
 

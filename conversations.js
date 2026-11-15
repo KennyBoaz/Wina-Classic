@@ -19,14 +19,16 @@
 const db = require("./db.js");
 const memory = require("./memory.js");
 const chatStore = require("./chatStore.js");
-const { sendWhatsAppText } = require("./whatsapp.js");
+const { sendWhatsAppText, sendWhatsAppReaction } = require("./whatsapp.js");
 const { HttpError } = require("./apiUtil.js");
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_STAFF_TEXT = 4000;
 
 const MESSAGE_COLUMNS = `m.id, m.phone, m.direction, m.sender_type, m.staff_id,
-  su.name AS staff_name, m.msg_type, m.body, m.delivery_status, m.error_text, m.created_at`;
+  su.name AS staff_name, m.msg_type, m.body, m.delivery_status, m.error_text, m.created_at,
+  m.wa_message_id, m.reply_to_wa_id, m.starred, m.reaction, m.customer_reaction,
+  q.body AS quoted_body, q.direction AS quoted_direction, q.sender_type AS quoted_sender`;
 
 function toDate(value) {
   if (!value) return null;
@@ -79,6 +81,7 @@ async function listMessages(phone, { after = null, before = null, limit = 50 } =
     `SELECT ${MESSAGE_COLUMNS}
        FROM messages m
        LEFT JOIN staff_users su ON su.id = m.staff_id
+       LEFT JOIN messages q ON q.wa_message_id = m.reply_to_wa_id
       WHERE ${where.join(" AND ")}
       ORDER BY m.id ${after ? "ASC" : "DESC"}
       LIMIT ?`,
@@ -94,6 +97,7 @@ async function getMessagesByIds(ids) {
     `SELECT ${MESSAGE_COLUMNS}
        FROM messages m
        LEFT JOIN staff_users su ON su.id = m.staff_id
+       LEFT JOIN messages q ON q.wa_message_id = m.reply_to_wa_id
       WHERE m.id IN (?)
       ORDER BY m.id ASC`,
     [ids]
@@ -113,7 +117,7 @@ async function markRead(phone) {
  * Returns { delivered, messages, error }. The message is saved even if
  * WhatsApp refuses it (status "failed"), so staff can see it and retry.
  */
-async function sendStaffMessage({ phone, text, staff }) {
+async function sendStaffMessage({ phone, text, staff, replyTo }) {
   const body = String(text ?? "").trim();
   if (!body) throw new HttpError(400, "Type a message first.", "EMPTY");
   if (body.length > MAX_STAFF_TEXT) {
@@ -129,9 +133,16 @@ async function sendStaffMessage({ phone, text, staff }) {
     );
   }
 
+  // Quote an earlier message of this same chat (replyTo = its id in our database).
+  let replyWaId = null;
+  if (replyTo) {
+    const quoted = await db.one("SELECT wa_message_id FROM messages WHERE id = ? AND phone = ?", [replyTo, phone]);
+    replyWaId = (quoted && quoted.wa_message_id) || null;
+  }
+
   let results;
   try {
-    results = await sendWhatsAppText(phone, body);
+    results = await sendWhatsAppText(phone, body, { replyTo: replyWaId });
   } catch (err) {
     results = [{ text: body, id: null, ok: false, error: err.message }];
   }
@@ -144,6 +155,7 @@ async function sendStaffMessage({ phone, text, staff }) {
         body: result.text,
         senderType: "staff",
         staffId: staff.id,
+        replyToWaId: replyWaId,
         waMessageId: result.id,
         status: result.ok ? "sent" : "failed",
         error: result.error,
@@ -197,7 +209,7 @@ async function retryStaffMessage(messageId) {
 
   let results;
   try {
-    results = await sendWhatsAppText(message.phone, message.body);
+    results = await sendWhatsAppText(message.phone, message.body, { replyTo: message.reply_to_wa_id || null });
   } catch (err) {
     results = [{ text: message.body, id: null, ok: false, error: err.message }];
   }
@@ -365,7 +377,149 @@ async function reopen(phone) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4: message and chat menu actions
+// ---------------------------------------------------------------------------
+
+const ALLOWED_REACTIONS = ["\u{1F44D}", "\u2764\uFE0F", "\u{1F64F}", "\u{1F60A}", "\u{1F602}", "\u{1F62E}", "\u{1F622}"];
+
+async function requireMessage(messageId) {
+  const message = await db.one("SELECT * FROM messages WHERE id = ?", [messageId]);
+  if (!message) throw new HttpError(404, "Message not found.", "NOT_FOUND");
+  return message;
+}
+
+/** Send (or remove, with emoji "") our emoji reaction on a CUSTOMER's message. */
+async function reactToMessage({ messageId, emoji }) {
+  const message = await requireMessage(messageId);
+  if (message.direction !== "in" || !message.wa_message_id) {
+    throw new HttpError(400, "You can only react to a customer's message.", "BAD_TARGET");
+  }
+  if (emoji !== "" && !ALLOWED_REACTIONS.includes(emoji)) {
+    throw new HttpError(400, "That reaction is not available.", "BAD_EMOJI");
+  }
+  const conversation = await requireConversation(message.phone);
+  if (!windowInfo(conversation.last_customer_message_at).open) {
+    throw new HttpError(409, "The 24-hour WhatsApp reply window has closed.", "WINDOW_CLOSED");
+  }
+
+  let result;
+  try {
+    result = await sendWhatsAppReaction(message.phone, message.wa_message_id, emoji);
+  } catch (err) {
+    result = { ok: false, error: err.message };
+  }
+  if (!result.ok) {
+    throw new HttpError(502, `WhatsApp did not accept the reaction: ${result.error}`, "SEND_FAILED");
+  }
+
+  await db.run("UPDATE messages SET reaction = ? WHERE id = ?", [emoji || null, messageId]);
+  return (await getMessagesByIds([messageId]))[0];
+}
+
+/** Forward a message WE sent (staff or bot) into another customer's chat. */
+async function forwardMessage({ messageId, toPhone, staff }) {
+  const message = await requireMessage(messageId);
+  if (message.direction !== "out") {
+    throw new HttpError(403, "Only messages we sent can be forwarded. A customer's messages stay in their own chat.", "FORWARD_NOT_ALLOWED");
+  }
+  if (toPhone === message.phone) throw new HttpError(400, "Choose a different chat.", "SAME_CHAT");
+  return sendStaffMessage({ phone: toPhone, text: message.body, staff });
+}
+
+async function setStarred(messageId, starred) {
+  await requireMessage(messageId);
+  await db.run("UPDATE messages SET starred = ? WHERE id = ?", [starred ? 1 : 0, messageId]);
+  return (await getMessagesByIds([messageId]))[0];
+}
+
+/** Append a message's text to the customer's private notes. */
+async function saveMessageToNotes(messageId) {
+  const message = await requireMessage(messageId);
+  const customer = await db.one("SELECT notes FROM customers WHERE phone = ?", [message.phone]);
+  const line = "- " + String(message.body || "").replace(/\s+/g, " ").slice(0, 400);
+  const next = ((customer && customer.notes) ? customer.notes + "\n" : "") + line;
+  if (next.length > 5000) throw new HttpError(400, "This customer's notes are full. Tidy them up first.", "NOTES_FULL");
+  await db.run("UPDATE customers SET notes = ? WHERE phone = ?", [next, message.phone]);
+  return next;
+}
+
+async function setPinned(phone, pinned) {
+  await requireConversation(phone);
+  await db.run("UPDATE conversations SET pinned = ? WHERE phone = ?", [pinned ? 1 : 0, phone]);
+}
+
+async function markUnread(phone) {
+  await requireConversation(phone);
+  await db.run("UPDATE conversations SET unread_count = 1 WHERE phone = ? AND unread_count = 0", [phone]);
+}
+
+async function assignChat(phone, staffId) {
+  await requireConversation(phone);
+  if (staffId !== null) {
+    const person = await db.one("SELECT id FROM staff_users WHERE id = ? AND active = 1", [staffId]);
+    if (!person) throw new HttpError(400, "That staff member is not available.", "BAD_STAFF");
+  }
+  await db.run("UPDATE conversations SET assigned_to = ? WHERE phone = ?", [staffId, phone]);
+}
+
+/** The bot forgets this customer (it will start the conversation fresh). Records stay. */
+async function resetBotMemory(phone) {
+  await requireConversation(phone);
+  await db.run("DELETE FROM bot_history WHERE phone = ?", [phone]);
+}
+
+/** The whole conversation as plain text (for disputes, records). */
+async function exportText(phone) {
+  await requireConversation(phone);
+  const customer = await db.one("SELECT whatsapp_name, display_name FROM customers WHERE phone = ?", [phone]);
+  const rows = await db.all(
+    `SELECT m.sender_type, m.body, m.created_at, su.name AS staff_name
+       FROM messages m LEFT JOIN staff_users su ON su.id = m.staff_id
+      WHERE m.phone = ? ORDER BY m.id ASC LIMIT 5000`,
+    [phone]
+  );
+  const stamp = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Africa/Kampala", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+  const name = (customer && (customer.display_name || customer.whatsapp_name)) || phone;
+  const lines = rows.map((row) => {
+    const who = row.sender_type === "customer" ? name : row.sender_type === "staff" ? `${row.staff_name || "Team"} (team)` : "Wina Classic bot";
+    return `[${stamp.format(new Date(row.created_at))}] ${who}: ${row.body || ""}`;
+  });
+  return {
+    filename: `chat-${phone}.txt`,
+    text: `WhatsApp conversation with ${name} (+${phone})\nExported ${stamp.format(new Date())} (Africa/Kampala)\n\n${lines.join("\n")}\n`,
+  };
+}
+
+/**
+ * Permanently erase a chat (admin only): messages, the bot's memory and the
+ * customer's record. With alsoRecords, their orders, appointments and tickets go too.
+ */
+async function deleteConversation(phone, alsoRecords) {
+  await requireConversation(phone);
+  await db.run("DELETE FROM bot_history WHERE phone = ?", [phone]);
+  if (alsoRecords) {
+    await db.run("DELETE FROM orders WHERE phone = ?", [phone]);
+    await db.run("DELETE FROM appointments WHERE phone = ?", [phone]);
+    await db.run("DELETE FROM issues WHERE phone = ?", [phone]);
+  }
+  await db.run("DELETE FROM customers WHERE phone = ?", [phone]); // messages + conversation go with it
+}
+
 module.exports = {
+  ALLOWED_REACTIONS,
+  reactToMessage,
+  forwardMessage,
+  setStarred,
+  saveMessageToNotes,
+  setPinned,
+  markUnread,
+  assignChat,
+  resetBotMemory,
+  exportText,
+  deleteConversation,
   WINDOW_MS,
   windowInfo,
   requireConversation,

@@ -44,7 +44,8 @@
     });
     c.send = h("button", { class: "send-btn", type: "button", "aria-label": "Send message", onClick: sendMessage }, icon("send"));
     c.composer = h("footer", { class: "composer" }, c.input, c.send);
-    c.box = h("div", { class: "thread-box hidden" }, c.head, c.alert, c.scroll, c.modebar, c.composer);
+    c.replybar = h("div", { class: "replybar hidden" });
+    c.box = h("div", { class: "thread-box hidden" }, c.head, c.alert, c.scroll, c.modebar, c.replybar, c.composer);
     c.empty = h("div", { class: "thread-empty" },
       h("span", { class: "brand-mark" }, "Wina ", h("em", null, "Classic")),
       h("p", null, "Select a chat to read the conversation, reply to the customer and see their orders."));
@@ -101,7 +102,7 @@
     if (c.open_appointments) tags.push(WC.pill(c.open_appointments + (c.open_appointments > 1 ? " appts" : " appt"), "p-type"));
     if (c.open_issues) tags.push(WC.pill(c.open_issues + (c.open_issues > 1 ? " issues" : " issue"), "p-type"));
 
-    return h("div", {
+    var el = h("div", {
       class: "row" + (S.chats.selected === c.phone ? " selected" : "") + (c.unread_count ? " unread" : ""),
       role: "listitem", tabindex: "0",
       onClick: function () { WC.selectChat(c.phone); },
@@ -109,11 +110,13 @@
     },
       WC.avatar(c.name, c.phone),
       h("div", { class: "row-main" },
-        h("div", { class: "row-top" }, h("span", { class: "row-name" }, name), h("span", { class: "row-time" }, fmt.listTime(c.last_message_at))),
+        h("div", { class: "row-top" }, h("span", { class: "row-name" }, c.pinned ? h("span", { class: "pin" }, icon("pin")) : null, name), h("span", { class: "row-time" }, fmt.listTime(c.last_message_at))),
         h("div", { class: "row-bottom" },
           h("span", { class: "row-preview" }, c.last_message_preview || "No messages yet"),
           c.unread_count ? h("span", { class: "badge" }, c.unread_count > 99 ? "99+" : c.unread_count) : null),
         h("div", { class: "row-tags" }, tags)));
+    WC.attachChatMenu(el, c);
+    return el;
   }
 
   function renderChatList() {
@@ -165,6 +168,7 @@
   WC.selectChat = function (phone) {
     var cs = S.chats, token = ++threadReq;
     cs.selected = phone;
+    cs.replyTo = null;
     cs.detail = null;
     cs.messages = [];
     cs.hasEarlier = false;
@@ -204,6 +208,7 @@
   WC.closeChat = function () {
     var cs = S.chats;
     threadReq++;
+    cs.replyTo = null;
     cs.selected = null;
     cs.detail = null;
     cs.messages = [];
@@ -224,6 +229,7 @@
     renderModebar();
     renderDetails();
     updateComposer();
+    renderReplyBar();
   }
 
   // ====================================================================
@@ -264,6 +270,12 @@
       actions.push(conv.status === "resolved"
         ? h("button", { class: "btn ghost small", type: "button", title: "Reopen", onClick: reopenChat }, icon("clock"), h("span", { class: "t" }, "Reopen"))
         : h("button", { class: "btn small", type: "button", title: "Resolve chat", onClick: resolveChat }, icon("check"), h("span", { class: "t" }, "Resolve")));
+    }
+    if (conv) {
+      actions.push(h("button", {
+        class: "icon-btn", type: "button", "aria-label": "Chat options", title: "Chat options",
+        onClick: function (e) { var r = e.currentTarget.getBoundingClientRect(); WC.chatMenu(cs.selected, conv, r.right - 250, r.bottom + 4); },
+      }, icon("more")));
     }
     actions.push(h("button", { class: "icon-btn", type: "button", "aria-label": "Customer details", title: "Customer details", onClick: toggleDetails }, icon("info")));
 
@@ -319,6 +331,13 @@
     return t.replace(/^\d+:\s*/, "") || "WhatsApp did not accept it.";
   }
 
+  function quoteBlock(m) {
+    if (!m.reply_to_wa_id) return null;
+    var who = m.quoted_direction === "in" ? "Customer" : m.quoted_sender === "bot" ? "Bot" : m.quoted_direction ? "Team" : "";
+    var text = m.quoted_body ? String(m.quoted_body).replace(/\s+/g, " ").slice(0, 140) : "Original message not available";
+    return h("div", { class: "quote " + (m.quoted_direction === "in" ? "q-in" : "q-out") }, who ? h("b", null, who) : null, h("span", null, text));
+  }
+
   function bubble(m, tail) {
     var out = m.direction === "out";
     var kind = m.sender_type;
@@ -326,17 +345,45 @@
     var body = m.body || "";
     var isMedia = /^\[.*\]$/.test(body);
 
-    return h("div", { class: "msg " + (out ? "out " : "in ") + kind + (tail ? " tail" : "") + (failed ? " failed" : ""), "data-id": m.id },
-      h("div", { class: "bubble" },
-        out ? h("div", { class: "sender" }, kind === "bot" ? "Bot" : (m.staff_name || "Team")) : null,
-        h("div", { class: "text" + (isMedia ? " media" : "") }, WC.linkify(body)),
-        h("div", { class: "meta" },
-          h("span", { class: "time" }, fmt.time(m.created_at)),
-          out && !failed ? WC.ticks(m.delivery_status || "pending") : null)),
+    var more = h("button", {
+      class: "more-btn", type: "button", "aria-label": "Message options",
+      onClick: function (e) { e.stopPropagation(); var r = e.currentTarget.getBoundingClientRect(); WC.messageMenu(m, r.left - 190, r.bottom + 2); },
+    }, icon("more"));
+
+    var bub = h("div", { class: "bubble" },
+      more,
+      out ? h("div", { class: "sender" }, kind === "bot" ? "Bot" : (m.staff_name || "Team")) : null,
+      quoteBlock(m),
+      h("div", { class: "text" + (isMedia ? " media" : "") }, WC.linkify(body)),
+      h("div", { class: "meta" },
+        m.starred ? h("span", { class: "star", title: "Starred" }, icon("star")) : null,
+        h("span", { class: "time" }, fmt.time(m.created_at)),
+        out && !failed ? WC.ticks(m.delivery_status || "pending") : null));
+
+    var reacts = (m.reaction || m.customer_reaction)
+      ? h("div", { class: "reacts" },
+          m.customer_reaction ? h("span", { title: "Customer's reaction" }, m.customer_reaction) : null,
+          m.reaction ? h("span", { title: "Your reaction" }, m.reaction) : null)
+      : null;
+
+    var el = h("div", {
+      class: "msg " + (out ? "out " : "in ") + kind + (tail ? " tail" : "") + (failed ? " failed" : "") + (reacts ? " has-reacts" : ""),
+      "data-id": m.id,
+      onContextmenu: function (e) {
+        if (e.shiftKey) return; // Shift + right-click = the normal browser menu
+        e.preventDefault();
+        if (WC.recentTouchOpen()) return; // a long-press already opened it
+        WC.messageMenu(m, e.clientX, e.clientY);
+      },
+    },
+      bub,
+      reacts,
       failed
         ? h("div", { class: "fail-row" }, icon("alert"), h("span", null, "Not delivered. " + friendlyError(m.error_text)),
             kind === "staff" ? h("button", { class: "link", type: "button", onClick: function () { retryMessage(m.id); } }, "Retry") : null)
         : null);
+    WC.longPress(el, function (x, y) { WC.messageMenu(m, x, y); });
+    return el;
   }
 
   function renderMessages(stickBottom, keepOffset) {
@@ -350,7 +397,12 @@
     }
     if (!cs.messages.length && cs.detail) nodes.push(h("div", { class: "day" }, h("span", null, "No messages yet")));
 
-    cs.messages.forEach(function (m) {
+    var clearedUpTo = WC.clearedUpTo(cs.selected);
+    if (clearedUpTo) {
+      nodes.push(h("div", { class: "cleared" }, "Earlier messages are hidden on this device. ",
+        h("button", { class: "link", type: "button", onClick: function () { WC.showAllMessages(cs.selected); } }, "Show all")));
+    }
+    cs.messages.filter(function (m) { return m.id > clearedUpTo; }).forEach(function (m) {
       var day = fmt.dayKey(m.created_at);
       if (day !== lastDay) {
         nodes.push(h("div", { class: "day" }, h("span", null, fmt.dayLabel(m.created_at))));
@@ -374,7 +426,8 @@
       var i = index[m.id];
       if (i === undefined) { cs.messages.push(m); changed = true; return; }
       var old = cs.messages[i];
-      if (old.delivery_status !== m.delivery_status || old.body !== m.body || old.error_text !== m.error_text) {
+      if (old.delivery_status !== m.delivery_status || old.body !== m.body || old.error_text !== m.error_text ||
+          old.starred !== m.starred || old.reaction !== m.reaction || old.customer_reaction !== m.customer_reaction) {
         cs.messages[i] = m;
         changed = true;
       }
@@ -472,13 +525,15 @@
 
     sending = true;
     updateComposer();
-    api("POST", "/conversations/" + phone + "/messages", { text: text }).then(function (r) {
+    api("POST", "/conversations/" + phone + "/messages", { text: text, reply_to: cs.replyTo ? cs.replyTo.id : null }).then(function (r) {
       sending = false;
       if (phone !== cs.selected) { updateComposer(); return; }
 
       if (r.status === 201 || r.status === 502) {
         input.value = "";
         autoGrow();
+        cs.replyTo = null;
+        renderReplyBar();
         mergeMessages(r.data.messages || []);
         renderMessages(true);
         if (r.status === 502) WC.toast(r.data.error || "WhatsApp did not accept the message.", "error");
@@ -512,8 +567,8 @@
   }
   WC.afterChatAction = afterAction;
 
-  function takeOver() {
-    var phone = S.chats.selected;
+  function takeOver(p) {
+    var phone = typeof p === "string" ? p : S.chats.selected;
     api("POST", "/conversations/" + phone + "/takeover", {}).then(function (r) {
       if (!r.ok) return WC.fail(r);
       WC.toast("You're handling this chat. The bot is paused.", "ok");
@@ -521,8 +576,8 @@
     });
   }
 
-  function handBack() {
-    var phone = S.chats.selected;
+  function handBack(p) {
+    var phone = typeof p === "string" ? p : S.chats.selected;
     api("POST", "/conversations/" + phone + "/handback", {}).then(function (r) {
       if (!r.ok) return WC.fail(r);
       WC.toast("The bot is answering this chat again.", "ok");
@@ -530,8 +585,8 @@
     });
   }
 
-  function reopenChat() {
-    var phone = S.chats.selected;
+  function reopenChat(p) {
+    var phone = typeof p === "string" ? p : S.chats.selected;
     api("POST", "/conversations/" + phone + "/reopen", {}).then(function (r) {
       if (!r.ok) return WC.fail(r);
       WC.toast("Chat reopened.", "ok");
@@ -539,8 +594,8 @@
     });
   }
 
-  function resolveChat() {
-    var phone = S.chats.selected;
+  function resolveChat(p) {
+    var phone = typeof p === "string" ? p : S.chats.selected;
     var note = h("textarea", { class: "input", placeholder: "Optional note, e.g. \"Called the customer, order confirmed\"" });
     WC.dialog({
       title: "Resolve this chat",
@@ -671,4 +726,32 @@
       if (S.chats.detail && S.chats.detail.customer) S.chats.detail.customer.notes = text;
     });
   }
+
+  // ====================================================================
+  // Reply (quote) bar and hooks used by the menus (admin-menu.js)
+  // ====================================================================
+  WC.setReply = function (m) {
+    S.chats.replyTo = m || null;
+    renderReplyBar();
+    if (m) R.chats.input.focus();
+  };
+
+  function renderReplyBar() {
+    var bar = R.chats.replybar, m = S.chats.replyTo;
+    if (!m) { bar.classList.add("hidden"); setKids(bar, []); return; }
+    var who = m.direction === "in" ? ((currentConv() && currentConv().name) || "Customer") : m.sender_type === "bot" ? "Bot" : (m.staff_name || "You");
+    setKids(bar, [
+      h("div", { class: "rq" }, h("b", null, "Replying to " + who), h("span", null, String(m.body || "").replace(/\s+/g, " ").slice(0, 160))),
+      h("button", { class: "icon-btn", type: "button", "aria-label": "Cancel reply", onClick: function () { WC.setReply(null); } }, icon("x")),
+    ]);
+    bar.classList.remove("hidden");
+  }
+
+  WC.mergeMessages = mergeMessages;
+  WC.rerenderMessages = function (stick) { renderMessages(!!stick); };
+  WC.retryMessage = retryMessage;
+  WC.takeOver = takeOver;
+  WC.handBack = handBack;
+  WC.reopenChat = reopenChat;
+  WC.resolveChat = resolveChat;
 })();

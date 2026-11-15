@@ -20,6 +20,7 @@
 
 const express = require("express");
 const db = require("../db.js");
+const auth = require("../auth.js");
 const svc = require("../conversations.js");
 const {
   HttpError,
@@ -38,6 +39,7 @@ function shapeConversation(row) {
     name: row.name || null,
     mode: row.mode,
     status: row.status,
+    pinned: Boolean(row.pinned),
     unread_count: Number(row.unread_count) || 0,
     assigned_to: row.assigned_to || null,
     assigned_name: row.assigned_name || null,
@@ -52,7 +54,7 @@ function shapeConversation(row) {
 }
 
 const CONVERSATION_SELECT = `
-  SELECT c.phone, c.mode, c.status, c.unread_count, c.assigned_to,
+  SELECT c.phone, c.mode, c.status, c.unread_count, c.assigned_to, c.pinned,
          c.last_customer_message_at, c.last_message_at, c.last_message_preview,
          COALESCE(cu.display_name, cu.whatsapp_name) AS name,
          su.name AS assigned_name,
@@ -146,7 +148,7 @@ router.get(
     const rows = await db.all(
       `${CONVERSATION_SELECT}
        ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-       ORDER BY (c.status = 'escalated') DESC, COALESCE(c.last_message_at, c.created_at) DESC, c.phone
+       ORDER BY c.pinned DESC, (c.status = 'escalated') DESC, COALESCE(c.last_message_at, c.created_at) DESC, c.phone
        LIMIT ? OFFSET ?`,
       [...params, limit + 1, offset]
     );
@@ -234,6 +236,7 @@ router.post(
     const result = await svc.sendStaffMessage({
       phone,
       text: req.body && req.body.text,
+      replyTo: req.body && Number(req.body.reply_to) > 0 ? Number(req.body.reply_to) : null,
       staff: req.staff,
     });
 
@@ -341,6 +344,114 @@ router.patch(
       [phone]
     );
     res.json({ customer });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Phase 4: message and chat menu actions
+// ---------------------------------------------------------------------------
+
+function messageId(req) {
+  const id = intParam(req.params.id, null, 1, Number.MAX_SAFE_INTEGER);
+  if (!id) throw new HttpError(404, "Message not found.", "NOT_FOUND");
+  return id;
+}
+
+/** Names of active staff (for "assign to..."), visible to every signed-in staff member. */
+router.get(
+  "/team",
+  wrap(async (_req, res) => {
+    res.json({ staff: await db.all("SELECT id, name FROM staff_users WHERE active = 1 ORDER BY name") });
+  })
+);
+
+router.post(
+  "/messages/:id/react",
+  wrap(async (req, res) => {
+    const emoji = req.body && typeof req.body.emoji === "string" ? req.body.emoji : "";
+    res.json({ message: await svc.reactToMessage({ messageId: messageId(req), emoji }) });
+  })
+);
+
+router.post(
+  "/messages/:id/star",
+  wrap(async (req, res) => {
+    res.json({ message: await svc.setStarred(messageId(req), Boolean(req.body && req.body.starred)) });
+  })
+);
+
+router.post(
+  "/messages/:id/save-note",
+  wrap(async (req, res) => {
+    res.json({ notes: await svc.saveMessageToNotes(messageId(req)) });
+  })
+);
+
+router.post(
+  "/messages/:id/forward",
+  wrap(async (req, res) => {
+    const toPhone = parsePhone(req.body && req.body.to_phone, 400);
+    const result = await svc.forwardMessage({ messageId: messageId(req), toPhone, staff: req.staff });
+    if (!result.delivered) {
+      return res.status(502).json({ error: `WhatsApp did not accept the message: ${result.error}`, code: "SEND_FAILED", delivered: false });
+    }
+    res.status(201).json({ delivered: true });
+  })
+);
+
+router.post(
+  "/conversations/:phone/pin",
+  wrap(async (req, res) => {
+    await svc.setPinned(parsePhone(req.params.phone), Boolean(req.body && req.body.pinned));
+    res.json({ ok: true });
+  })
+);
+
+router.post(
+  "/conversations/:phone/unread",
+  wrap(async (req, res) => {
+    await svc.markUnread(parsePhone(req.params.phone));
+    res.json({ ok: true });
+  })
+);
+
+router.post(
+  "/conversations/:phone/assign",
+  wrap(async (req, res) => {
+    const raw = req.body ? req.body.staff_id : null;
+    const staffId = raw === null || raw === undefined || raw === "" ? null : intParam(raw, null, 1, Number.MAX_SAFE_INTEGER);
+    await svc.assignChat(parsePhone(req.params.phone), staffId);
+    res.json({ ok: true });
+  })
+);
+
+router.post(
+  "/conversations/:phone/reset-bot-memory",
+  wrap(async (req, res) => {
+    await svc.resetBotMemory(parsePhone(req.params.phone));
+    res.json({ ok: true });
+  })
+);
+
+router.get(
+  "/conversations/:phone/export",
+  wrap(async (req, res) => {
+    res.json(await svc.exportText(parsePhone(req.params.phone)));
+  })
+);
+
+/** Admin only. The body must repeat the phone number as a safety check. */
+router.post(
+  "/conversations/:phone/delete",
+  auth.requireAdmin,
+  wrap(async (req, res) => {
+    const phone = parsePhone(req.params.phone);
+    if (!req.body || req.body.confirm !== phone) {
+      throw new HttpError(400, "Type the phone number to confirm.", "CONFIRM_MISMATCH");
+    }
+    await svc.deleteConversation(phone, Boolean(req.body.also_records));
+    console.warn(`[admin] ${req.staff.email} permanently deleted the conversation with ${phone}` + (req.body.also_records ? " and its records." : "."));
+    res.json({ ok: true });
   })
 );
 

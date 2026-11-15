@@ -77,7 +77,7 @@ async function getConversation(phone) {
  * server restarts, unlike the in-memory Set in server.js).
  * Otherwise returns { duplicate: false, conversation, messageId }.
  */
-async function recordIncoming({ id, from, name, type, text, timestamp }) {
+async function recordIncoming({ id, from, name, type, text, timestamp, replyTo }) {
   await ensureCustomer(from, name);
 
   const createdAt = fromWhatsAppTimestamp(timestamp);
@@ -87,9 +87,9 @@ async function recordIncoming({ id, from, name, type, text, timestamp }) {
   try {
     insert = await db.run(
       `INSERT INTO messages
-         (phone, direction, sender_type, msg_type, body, wa_message_id, created_at)
-       VALUES (?, 'in', 'customer', ?, ?, ?, ?)`,
-      [from, clip(type, 20) || "text", body, clip(id, 128), createdAt]
+         (phone, direction, sender_type, msg_type, body, wa_message_id, reply_to_wa_id, created_at)
+       VALUES (?, 'in', 'customer', ?, ?, ?, ?, ?)`,
+      [from, clip(type, 20) || "text", body, clip(id, 128), clip(replyTo, 128), createdAt]
     );
   } catch (err) {
     if (err && err.code === "ER_DUP_ENTRY") return { duplicate: true };
@@ -130,14 +130,15 @@ async function recordOutgoing({
   waMessageId = null,
   status = "sent",
   error = null,
+  replyToWaId = null,
 }) {
   await ensureCustomer(phone, null);
 
   const insert = await db.run(
     `INSERT INTO messages
        (phone, direction, sender_type, staff_id, msg_type, body,
-        wa_message_id, delivery_status, error_text, created_at)
-     VALUES (?, 'out', ?, ?, 'text', ?, ?, ?, ?, UTC_TIMESTAMP(3))`,
+        wa_message_id, delivery_status, error_text, reply_to_wa_id, created_at)
+     VALUES (?, 'out', ?, ?, 'text', ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))`,
     [
       phone,
       senderType,
@@ -146,6 +147,7 @@ async function recordOutgoing({
       clip(waMessageId, 128),
       status,
       clip(error, 500),
+      clip(replyToWaId, 128),
     ]
   );
 
@@ -217,7 +219,17 @@ async function markEscalated(phone, { pauseBot = false } = {}) {
   }
 }
 
+/** A customer reacted with an emoji to one of our messages (emoji "" = they removed it). */
+async function setCustomerReaction(waMessageId, emoji) {
+  if (!waMessageId) return;
+  await db.run("UPDATE messages SET customer_reaction = ? WHERE wa_message_id = ?", [
+    emoji ? clip(emoji, 16) : null,
+    waMessageId,
+  ]);
+}
+
 module.exports = {
+  setCustomerReaction,
   ensureCustomer,
   getConversation,
   recordIncoming,
