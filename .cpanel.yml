@@ -1,7 +1,7 @@
 ---
 deployment:
   tasks:
-    - export DEPLOYPATH=/home/spathe/repositories/Wina-Classic/
+    - export DEPLOYPATH=/home/spathe/winaclassic/
+    - /bin/cp -R * $DEPLOYPATH
     - /bin/mkdir -p $DEPLOYPATH/tmp
-    - /bin/cp -R public routes scripts server.js systemPrompt.js tools.js whatsapp.js package.json package-lock.json $DEPLOYPATH
     - /bin/touch $DEPLOYPATH/tmp/restart.txt
