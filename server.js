@@ -39,6 +39,7 @@ const { generateReply } = require("./gemini.js");
 const { getHistory, saveHistory } = require("./memory.js");
 const chatStore = require("./chatStore.js");
 const db = require("./db.js");
+const { ensureSchema } = require("./schema.js");
 const path = require("path");
 const { createApiRouter } = require("./routes/index.js");
 
@@ -471,12 +472,19 @@ app.listen(() => {
   );
 
   db.ping()
-    .then(() => console.log("[boot] Database connection OK."))
+    .then(() => {
+      console.log("[boot] Database connection OK.");
+      return ensureSchema();
+    })
+    .then((added) => {
+      // console.error on purpose: stderr.log is the file this host keeps
+      if (added && added.length) console.error("[boot] Database upgraded automatically. Added: " + added.join(", ") + ".");
+    })
     .catch((err) =>
       console.error(
         "[boot] DATABASE CONNECTION FAILED:",
         err.message,
-        "- check DB_HOST / DB_USER / DB_PASSWORD / DB_NAME in .env and that the schema was imported."
+        "- check DB_HOST / DB_USER / DB_PASSWORD / DB_NAME in .env, and that the database user may ALTER tables."
       )
     );
 });

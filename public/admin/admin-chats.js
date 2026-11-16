@@ -133,13 +133,24 @@
       (cs.search ? "&search=" + encodeURIComponent(cs.search) : "");
   }
 
+  /** The list could not be loaded: say so (instead of an empty panel) and offer a retry. */
+  function listError(r) {
+    WC.fail(r);
+    if (S.chats.items.length) return;
+    setKids(R.chats.rows, [h("div", { class: "list-empty" },
+      h("p", null, h("b", null, "Couldn't load the chats.")),
+      h("p", { class: "muted" }, (r.data && r.data.error) || "Please try again."),
+      h("button", { class: "btn ghost small", type: "button", onClick: function () { WC.loadChats(true); } }, "Try again"))]);
+    R.chats.more.classList.add("hidden");
+  }
+
   /** reset=true: start from the first page. reset=false: add the next page. */
   WC.loadChats = function (reset) {
     var cs = S.chats, token = ++listReq;
     if (reset) cs.offset = 0;
     return api("GET", chatsUrl(30, cs.offset)).then(function (r) {
       if (token !== listReq) return;
-      if (!r.ok) return WC.fail(r);
+      if (!r.ok) return listError(r);
       var rows = r.data.conversations || [];
       cs.items = reset ? rows : cs.items.concat(rows);
       cs.hasMore = !!r.data.has_more;

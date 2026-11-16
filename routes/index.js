@@ -25,8 +25,12 @@ function errorHandler(err, req, res, next) {
   const status = Number.isInteger(err.status) ? err.status : 500;
   if (status >= 500) console.error("[api] Unexpected error:", err);
 
+  // A missing table or column means the database was not upgraded: say so in plain words.
+  const needsUpgrade = err && (err.code === "ER_BAD_FIELD_ERROR" || err.code === "ER_NO_SUCH_TABLE");
   res.status(status).json({
-    error: status >= 500 ? "Something went wrong on the server." : err.message,
+    error: needsUpgrade
+      ? "The database is missing something the new version needs. Restart the app once (it upgrades itself), or run the latest schema upgrade file in phpMyAdmin."
+      : status >= 500 ? "Something went wrong on the server." : err.message,
     code: err instanceof HttpError ? err.code : undefined,
   });
 }
