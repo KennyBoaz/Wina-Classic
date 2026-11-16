@@ -507,3 +507,6 @@ table.table { width: 100%; border-collapse: collapse; }
   .tab .tl-s { display: inline; }
   .tab { letter-spacing: .04em; }
 }
+
+/* shown when a dashboard file failed to load */
+.notice { flex: none; background: var(--danger-soft); color: var(--danger); border-bottom: 1px solid #e7bcb9; padding: 8px 18px; font-size: 13px; }

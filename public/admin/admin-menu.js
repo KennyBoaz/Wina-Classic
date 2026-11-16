@@ -1,458 +1,396 @@
-/**
- * routes/chatRoutes.js   (all require a logged-in staff member)
- *
- *   GET   /api/summary                          counts + latest ids (for badges / polling)
- *   GET   /api/conversations                    ?filter=&search=&limit=&offset=
- *   GET   /api/conversations/:phone             chat details + that customer's orders/appointments/issues
- *   GET   /api/conversations/:phone/messages    ?after=ID | ?before=ID & limit=
- *   POST  /api/conversations/:phone/messages    { text }  reply as staff
- *   POST  /api/messages/:id/retry               resend a failed staff message
- *   POST  /api/conversations/:phone/read        clear the unread badge
- *   POST  /api/conversations/:phone/takeover    stop the bot, staff answer
- *   POST  /api/conversations/:phone/handback    bot answers again
- *   POST  /api/conversations/:phone/resolve     { note? } mark the chat handled
- *   POST  /api/conversations/:phone/reopen
- *   PATCH /api/conversations/:phone/customer    { display_name?, notes? }
- *
- * filter = active (default: everything not resolved) | unread | human |
- *          escalated | window_open | open_issue | resolved | all
- */
+/* Shop Desk - WhatsApp-style right-click menus (long-press on a phone).
+ *   right-click a MESSAGE  -> react, reply, copy, forward, star, save to notes, info, retry
+ *   right-click a CHAT     -> take over, resolve, assign, pin, unread, export, clear view, reset bot, delete
+ * Hold Shift while right-clicking to get the normal browser menu instead. */
+(function () {
+  "use strict";
 
-const express = require("express");
-const db = require("../db.js");
-const auth = require("../auth.js");
-const svc = require("../conversations.js");
-const {
-  HttpError,
-  wrap,
-  parsePhone,
-  intParam,
-  searchTerm,
-  cleanText,
-} = require("../apiUtil.js");
+  var WC = window.WC;
+  var h = WC.h, S = WC.S, api = WC.api, icon = WC.icon, fmt = WC.fmt, setKids = WC.setKids;
 
-const router = express.Router();
+  WC.menuLoaded = true; // lets the dashboard notice if this file did not load
 
-function shapeConversation(row) {
-  return {
-    phone: row.phone,
-    name: row.name || null,
-    mode: row.mode,
-    status: row.status,
-    pinned: Boolean(row.pinned),
-    unread_count: Number(row.unread_count) || 0,
-    assigned_to: row.assigned_to || null,
-    assigned_name: row.assigned_name || null,
-    last_message_at: row.last_message_at,
-    last_message_preview: row.last_message_preview,
-    last_customer_message_at: row.last_customer_message_at,
-    window: svc.windowInfo(row.last_customer_message_at),
-    open_issues: Number(row.open_issues) || 0,
-    open_orders: Number(row.open_orders) || 0,
-    open_appointments: Number(row.open_appointments) || 0,
+  WC.REACTIONS = ["\u{1F44D}", "\u2764\uFE0F", "\u{1F64F}", "\u{1F60A}", "\u{1F602}", "\u{1F62E}", "\u{1F622}"];
+
+  // ====================================================================
+  // The menu itself
+  // ====================================================================
+  var current = null;
+  var touchOpenAt = 0; // when a long-press last opened a menu (phones)
+  WC.recentTouchOpen = function () { return Date.now() - touchOpenAt < 900; };
+
+  WC.closeMenu = function () {
+    if (current) { current.cleanup(); current = null; }
   };
-}
 
-const CONVERSATION_SELECT = `
-  SELECT c.phone, c.mode, c.status, c.unread_count, c.assigned_to, c.pinned,
-         c.last_customer_message_at, c.last_message_at, c.last_message_preview,
-         COALESCE(cu.display_name, cu.whatsapp_name) AS name,
-         su.name AS assigned_name,
-         (SELECT COUNT(*) FROM issues i WHERE i.phone = c.phone AND i.status IN ('new','in_progress')) AS open_issues,
-         (SELECT COUNT(*) FROM orders o WHERE o.phone = c.phone AND o.status IN ('new','in_progress')) AS open_orders,
-         (SELECT COUNT(*) FROM appointments a WHERE a.phone = c.phone AND a.status IN ('new','in_progress')) AS open_appointments
-    FROM conversations c
-    JOIN customers cu ON cu.phone = c.phone
-    LEFT JOIN staff_users su ON su.id = c.assigned_to`;
+  /** items: { label, icon, onClick, danger, hint } | { sep: true } | { reactions: true, active, onPick } */
+  WC.openMenu = function (x, y, items) {
+    WC.closeMenu();
+    var openedAt = Date.now();
+    // Only after a long-press: ignore the finger-lift that would otherwise tap an item.
+    var guarded = WC.recentTouchOpen();
+    var menu = h("div", { class: "ctx", role: "menu" });
+    var buttons = [];
 
-// ---------------------------------------------------------------------------
-// Summary (badges + "something new happened" detection)
-// ---------------------------------------------------------------------------
-
-router.get(
-  "/summary",
-  wrap(async (_req, res) => {
-    const row = await db.one(`
-      SELECT
-        (SELECT COUNT(*) FROM conversations WHERE status = 'escalated') AS escalated_chats,
-        (SELECT COUNT(*) FROM conversations WHERE mode = 'human' AND status <> 'resolved') AS human_chats,
-        (SELECT COUNT(*) FROM conversations WHERE unread_count > 0 AND status <> 'resolved') AS unread_chats,
-        (SELECT COALESCE(SUM(unread_count), 0) FROM conversations
-          WHERE (mode = 'human' OR status = 'escalated') AND status <> 'resolved') AS unread_needing_staff,
-        (SELECT COUNT(*) FROM issues WHERE status = 'new') AS new_issues,
-        (SELECT COUNT(*) FROM orders WHERE status = 'new') AS new_orders,
-        (SELECT COUNT(*) FROM appointments WHERE status = 'new') AS new_appointments,
-        (SELECT COALESCE(MAX(id), 0) FROM messages WHERE direction = 'in') AS last_incoming_message_id,
-        (SELECT COALESCE(MAX(id), 0) FROM messages) AS last_message_id,
-        (SELECT COALESCE(MAX(id), 0) FROM issues) AS last_issue_id,
-        (SELECT COALESCE(MAX(id), 0) FROM orders) AS last_order_id,
-        (SELECT COALESCE(MAX(id), 0) FROM appointments) AS last_appointment_id`);
-
-    const summary = {};
-    for (const [key, value] of Object.entries(row)) summary[key] = Number(value) || 0;
-    res.json({ summary });
-  })
-);
-
-// ---------------------------------------------------------------------------
-// Chat list
-// ---------------------------------------------------------------------------
-
-router.get(
-  "/conversations",
-  wrap(async (req, res) => {
-    const filter = String(req.query.filter || "active");
-    const where = [];
-    const params = [];
-
-    switch (filter) {
-      case "all":
-        break;
-      case "unread":
-        where.push("c.unread_count > 0");
-        break;
-      case "human":
-        where.push("c.mode = 'human'");
-        break;
-      case "escalated":
-        where.push("c.status = 'escalated'");
-        break;
-      case "window_open":
-        where.push("c.last_customer_message_at >= ?");
-        params.push(new Date(Date.now() - svc.WINDOW_MS));
-        break;
-      case "open_issue":
-        where.push(
-          "EXISTS (SELECT 1 FROM issues i WHERE i.phone = c.phone AND i.status IN ('new','in_progress'))"
-        );
-        break;
-      case "resolved":
-        where.push("c.status = 'resolved'");
-        break;
-      case "active":
-        where.push("c.status <> 'resolved'");
-        break;
-      default:
-        throw new HttpError(400, "Unknown filter.", "BAD_FILTER");
-    }
-
-    const term = searchTerm(req.query.search);
-    if (term) {
-      where.push("(cu.display_name LIKE ? OR cu.whatsapp_name LIKE ? OR c.phone LIKE ?)");
-      params.push(`%${term}%`, `%${term}%`, `%${term}%`);
-    }
-
-    const limit = intParam(req.query.limit, 30, 1, 100);
-    const offset = intParam(req.query.offset, 0, 0, 100000);
-
-    const rows = await db.all(
-      `${CONVERSATION_SELECT}
-       ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
-       ORDER BY c.pinned DESC, (c.status = 'escalated') DESC, COALESCE(c.last_message_at, c.created_at) DESC, c.phone
-       LIMIT ? OFFSET ?`,
-      [...params, limit + 1, offset]
-    );
-
-    res.json({
-      conversations: rows.slice(0, limit).map(shapeConversation),
-      has_more: rows.length > limit,
+    items.forEach(function (it) {
+      if (it.sep) { menu.appendChild(h("div", { class: "ctx-sep" })); return; }
+      if (it.reactions) {
+        menu.appendChild(h("div", { class: "ctx-react" }, WC.REACTIONS.map(function (e) {
+          return h("button", {
+            class: "ctx-emoji" + (it.active === e ? " on" : ""), type: "button", "aria-label": "React " + e,
+            onClick: function (ev) { ev.stopPropagation(); if (guarded && Date.now() - openedAt < 350) return; WC.closeMenu(); it.onPick(e); },
+          }, e);
+        })));
+        return;
+      }
+      var btn = h("button", {
+        class: "ctx-item" + (it.danger ? " danger" : ""), type: "button", role: "menuitem",
+        onClick: function (ev) {
+          ev.stopPropagation();
+          if (guarded && Date.now() - openedAt < 350) return;
+          WC.closeMenu();
+          it.onClick();
+        },
+      }, it.icon ? icon(it.icon) : h("span", { class: "ctx-gap" }), h("span", { class: "ctx-label" }, it.label), it.hint ? h("span", { class: "ctx-hint" }, it.hint) : null);
+      buttons.push(btn);
+      menu.appendChild(btn);
     });
-  })
-);
 
-// ---------------------------------------------------------------------------
-// One chat
-// ---------------------------------------------------------------------------
+    document.body.appendChild(menu);
+    var left = Math.max(8, Math.min(x, window.innerWidth - menu.offsetWidth - 8));
+    var top = Math.max(8, Math.min(y, window.innerHeight - menu.offsetHeight - 8));
+    menu.style.left = left + "px";
+    menu.style.top = top + "px";
 
-router.get(
-  "/conversations/:phone",
-  wrap(async (req, res) => {
-    const phone = parsePhone(req.params.phone);
-    const row = await db.one(`${CONVERSATION_SELECT} WHERE c.phone = ?`, [phone]);
-    if (!row) throw new HttpError(404, "Chat not found.", "NOT_FOUND");
+    function onDown(e) { if (!menu.contains(e.target)) WC.closeMenu(); }
+    function onKey(e) {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); WC.closeMenu(); return; }
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        var i = buttons.indexOf(document.activeElement);
+        i = e.key === "ArrowDown" ? (i + 1) % buttons.length : (i - 1 + buttons.length) % buttons.length;
+        if (buttons[i]) buttons[i].focus();
+      }
+    }
+    function close() { WC.closeMenu(); }
+    function onScroll() { if (Date.now() - openedAt > 300) WC.closeMenu(); } // ignore a scroll that was already under way
+    document.addEventListener("mousedown", onDown, true);
+    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("blur", close);
+    document.addEventListener("scroll", onScroll, true);
 
-    const customer = await db.one(
-      "SELECT phone, whatsapp_name, display_name, notes, created_at FROM customers WHERE phone = ?",
-      [phone]
-    );
-    const orders = await db.all(
-      `SELECT id, ref, items, quantity, delivery_address, delivery_date, status, created_at
-         FROM orders WHERE phone = ? ORDER BY created_at DESC, id DESC LIMIT 20`,
-      [phone]
-    );
-    const appointments = await db.all(
-      `SELECT id, ref, appt_date, appt_time, purpose, status, created_at
-         FROM appointments WHERE phone = ? ORDER BY created_at DESC, id DESC LIMIT 20`,
-      [phone]
-    );
-    const issues = await db.all(
-      `SELECT id, ref, type, summary, details, status, created_at
-         FROM issues WHERE phone = ? ORDER BY created_at DESC, id DESC LIMIT 20`,
-      [phone]
-    );
+    current = {
+      cleanup: function () {
+        menu.remove();
+        document.removeEventListener("mousedown", onDown, true);
+        document.removeEventListener("keydown", onKey, true);
+        window.removeEventListener("resize", close);
+        window.removeEventListener("blur", close);
+        document.removeEventListener("scroll", onScroll, true);
+      },
+    };
+  };
 
-    res.json({
-      conversation: shapeConversation(row),
-      customer,
-      orders: orders.map((order) => ({ ...order, items: parseItems(order.items) })),
-      appointments,
-      issues,
-    });
-  })
-);
+  /** Touch screens: press and hold to open the menu. */
+  WC.longPress = function (el, handler) {
+    var timer = null, sx = 0, sy = 0;
+    function cancel() { if (timer) { clearTimeout(timer); timer = null; } }
+    el.addEventListener("touchstart", function (e) {
+      var t = e.touches[0];
+      sx = t.clientX; sy = t.clientY;
+      cancel();
+      timer = setTimeout(function () { timer = null; touchOpenAt = Date.now(); handler(sx, sy); }, 520);
+    }, { passive: true });
+    el.addEventListener("touchmove", function (e) {
+      var t = e.touches[0];
+      if (Math.abs(t.clientX - sx) > 10 || Math.abs(t.clientY - sy) > 10) cancel();
+    }, { passive: true });
+    el.addEventListener("touchend", cancel);
+    el.addEventListener("touchcancel", cancel);
+  };
 
-function parseItems(text) {
-  try {
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return text ? [String(text)] : [];
+  // ====================================================================
+  // Message menu
+  // ====================================================================
+  WC.messageMenu = function (m, x, y) {
+    var conv = S.chats.detail && S.chats.detail.conversation;
+    var windowOpen = !!(conv && conv.window && conv.window.expires_at && new Date(conv.window.expires_at).getTime() > Date.now());
+    var selection = String((window.getSelection && window.getSelection()) || "").trim();
+    var items = [];
+
+    if (m.direction === "in" && windowOpen && m.wa_message_id) {
+      items.push({ reactions: true, active: m.reaction, onPick: function (e) { react(m, e === m.reaction ? "" : e); } });
+    }
+    if (windowOpen) items.push({ label: "Reply", icon: "reply", onClick: function () { WC.setReply(m); } });
+    items.push({ label: selection ? "Copy selected text" : "Copy text", icon: "copy", onClick: function () { WC.copy(selection || m.body || ""); } });
+    if (m.direction === "out") items.push({ label: "Forward\u2026", icon: "forward", onClick: function () { forwardDialog(m); } });
+    items.push({ label: m.starred ? "Remove star" : "Star message", icon: "star", onClick: function () { star(m); } });
+    items.push({ label: "Save to customer notes", icon: "edit", onClick: function () { saveNote(m); } });
+    items.push({ label: "Message info", icon: "info", onClick: function () { infoDialog(m); } });
+    if (m.delivery_status === "failed" && m.sender_type === "staff") {
+      items.push({ sep: true });
+      items.push({ label: "Retry sending", icon: "refresh", onClick: function () { WC.retryMessage(m.id); } });
+    }
+    WC.openMenu(x, y, items);
+  };
+
+  function mergeOne(message) {
+    if (!message) return;
+    WC.mergeMessages([message]);
+    WC.rerenderMessages(false);
   }
-}
 
-router.get(
-  "/conversations/:phone/messages",
-  wrap(async (req, res) => {
-    const phone = parsePhone(req.params.phone);
-    await svc.requireConversation(phone);
-
-    const after = intParam(req.query.after, null, 1, Number.MAX_SAFE_INTEGER);
-    const before = intParam(req.query.before, null, 1, Number.MAX_SAFE_INTEGER);
-    const limit = intParam(req.query.limit, after ? 100 : 50, 1, 200);
-
-    const messages = await svc.listMessages(phone, { after, before, limit });
-    res.json({ messages });
-  })
-);
-
-// ---------------------------------------------------------------------------
-// Actions
-// ---------------------------------------------------------------------------
-
-router.post(
-  "/conversations/:phone/messages",
-  wrap(async (req, res) => {
-    const phone = parsePhone(req.params.phone);
-    const result = await svc.sendStaffMessage({
-      phone,
-      text: req.body && req.body.text,
-      replyTo: req.body && Number(req.body.reply_to) > 0 ? Number(req.body.reply_to) : null,
-      staff: req.staff,
+  function react(m, emoji) {
+    api("POST", "/messages/" + m.id + "/react", { emoji: emoji }).then(function (r) {
+      if (!r.ok) return WC.fail(r);
+      mergeOne(r.data.message);
     });
+  }
 
-    if (!result.delivered) {
-      return res.status(502).json({
-        error: `WhatsApp did not accept the message: ${result.error}`,
-        code: "SEND_FAILED",
-        delivered: false,
-        messages: result.messages,
+  function star(m) {
+    api("POST", "/messages/" + m.id + "/star", { starred: !m.starred }).then(function (r) {
+      if (!r.ok) return WC.fail(r);
+      mergeOne(r.data.message);
+    });
+  }
+
+  function saveNote(m) {
+    api("POST", "/messages/" + m.id + "/save-note", {}).then(function (r) {
+      if (!r.ok) return WC.fail(r);
+      WC.toast("Saved to the customer's notes.", "ok");
+      if (S.chats.detail && S.chats.detail.customer) S.chats.detail.customer.notes = r.data.notes;
+      WC.refreshDetail();
+    });
+  }
+
+  function infoDialog(m) {
+    function row(label, value) {
+      return value ? h("div", { class: "info-row" }, h("b", null, label), h("span", null, value)) : null;
+    }
+    var by = m.direction === "in" ? "The customer" : m.sender_type === "bot" ? "The bot" : (m.staff_name || "A team member");
+    var status = m.direction === "in" ? "Received" : ({ pending: "Sending", sent: "Sent", delivered: "Delivered", read: "Read by the customer", failed: "Not delivered" }[m.delivery_status] || "");
+    WC.dialog({
+      title: "Message info",
+      body: [
+        h("div", { class: "info-quote" }, m.body || ""),
+        row("From", by),
+        row("Time", fmt.stamp(m.created_at)),
+        row("Status", status),
+        row("Problem", m.error_text),
+        row("Replying to", m.quoted_body ? String(m.quoted_body).slice(0, 140) : (m.reply_to_wa_id ? "An earlier message" : "")),
+        row("Starred", m.starred ? "Yes" : ""),
+        h("div", { class: "info-row" }, h("b", null, "WhatsApp ID"), h("span", { class: "mono" }, m.wa_message_id || "none")),
+      ],
+      actions: [{ label: "Close", kind: "ghost" }],
+    });
+  }
+
+  function forwardDialog(m) {
+    var picked = null, rows = [];
+    var list = h("div", { class: "pick-list" });
+    var search = h("input", { class: "input", type: "search", placeholder: "Search a customer", "aria-label": "Search customers" });
+
+    function draw() {
+      setKids(list, rows.length ? rows.map(function (c) {
+        return h("button", {
+          class: "pick" + (picked === c.phone ? " on" : ""), type: "button",
+          onClick: function () { picked = c.phone; draw(); },
+        }, WC.avatar(c.name, c.phone), h("span", null, c.name || WC.phone(c.phone)), h("small", null, WC.phone(c.phone)));
+      }) : [h("div", { class: "d-none" }, "No chats are inside the 24-hour reply window.")]);
+    }
+    function load() {
+      api("GET", "/conversations?filter=window_open&limit=30" + (search.value.trim() ? "&search=" + encodeURIComponent(search.value.trim()) : "")).then(function (r) {
+        rows = (r.data.conversations || []).filter(function (c) { return c.phone !== m.phone; });
+        draw();
       });
     }
-    res.status(201).json({ delivered: true, messages: result.messages });
-  })
-);
+    search.addEventListener("input", WC.debounce(load, 250));
+    load();
 
-router.post(
-  "/messages/:id/retry",
-  wrap(async (req, res) => {
-    const id = intParam(req.params.id, null, 1, Number.MAX_SAFE_INTEGER);
-    if (!id) throw new HttpError(404, "Message not found.", "NOT_FOUND");
+    WC.dialog({
+      title: "Forward message",
+      body: [
+        h("div", { class: "info-quote" }, m.body || ""),
+        h("p", { class: "muted" }, "It is sent as a message from you, and the bot pauses in that chat. Only chats inside the 24-hour window are listed."),
+        search, list,
+      ],
+      actions: [
+        { label: "Cancel", kind: "ghost" },
+        {
+          label: "Forward",
+          onClick: function (dlg) {
+            if (!picked) { dlg.error("Choose a chat first."); return false; }
+            return api("POST", "/messages/" + m.id + "/forward", { to_phone: picked }).then(function (r) {
+              if (!r.ok) { dlg.error((r.data && r.data.error) || "Could not forward."); return false; }
+              WC.toast("Message forwarded.", "ok");
+              WC.refreshChatList();
+            });
+          },
+        },
+      ],
+    });
+  }
 
-    const result = await svc.retryStaffMessage(id);
-    if (!result.delivered) {
-      return res.status(502).json({
-        error: `WhatsApp did not accept the message: ${result.error}`,
-        code: "SEND_FAILED",
-        delivered: false,
-        message: result.message,
-      });
+  // ====================================================================
+  // Chat menu
+  // ====================================================================
+  WC.attachChatMenu = function (el, c) {
+    el.addEventListener("contextmenu", function (e) {
+      if (e.shiftKey) return;
+      e.preventDefault();
+      if (WC.recentTouchOpen()) return; // a long-press already opened it
+      WC.chatMenu(c.phone, c, e.clientX, e.clientY);
+    });
+    WC.longPress(el, function (x, y) { WC.chatMenu(c.phone, c, x, y); });
+  };
+
+  WC.chatMenu = function (phone, conv, x, y) {
+    var admin = S.user && S.user.role === "admin";
+    var selected = S.chats.selected === phone;
+    var items = [];
+
+    if (!selected) items.push({ label: "Open chat", icon: "chat", onClick: function () { WC.selectChat(phone); } });
+    items.push(conv.mode === "human"
+      ? { label: "Hand back to bot", icon: "chat", onClick: function () { WC.handBack(phone); } }
+      : { label: "Take over from the bot", icon: "user", onClick: function () { WC.takeOver(phone); } });
+    items.push(conv.status === "resolved"
+      ? { label: "Reopen chat", icon: "clock", onClick: function () { WC.reopenChat(phone); } }
+      : { label: "Resolve chat\u2026", icon: "check", onClick: function () { WC.resolveChat(phone); } });
+    items.push({ sep: true });
+    items.push({ label: "Assign to me", icon: "user", onClick: function () { assign(phone, S.user.id); } });
+    items.push({ label: "Assign to\u2026", icon: "users", onClick: function () { assignDialog(phone, conv); } });
+    items.push({ label: "Mark as unread", icon: "unread", onClick: function () { markUnread(phone, selected); } });
+    items.push({ label: conv.pinned ? "Unpin from top" : "Pin to top", icon: "pin", onClick: function () { pin(phone, !conv.pinned); } });
+    items.push({ sep: true });
+    items.push({ label: "Export conversation (.txt)", icon: "download", onClick: function () { exportChat(phone); } });
+    if (selected) items.push({ label: "Clear view (hide earlier messages)", icon: "eyeoff", onClick: function () { clearView(phone); } });
+    items.push({ label: "Reset bot memory\u2026", icon: "refresh", onClick: function () { resetMemory(phone); } });
+    if (selected) items.push({ label: "Close chat view", icon: "x", hint: "Esc", onClick: function () { WC.closeChat(); } });
+    if (admin) {
+      items.push({ sep: true });
+      items.push({ label: "Delete conversation\u2026", icon: "trash", danger: true, onClick: function () { deleteDialog(phone, conv); } });
     }
-    res.json({ delivered: true, message: result.message });
-  })
-);
+    WC.openMenu(x, y, items);
+  };
 
-router.post(
-  "/conversations/:phone/read",
-  wrap(async (req, res) => {
-    const phone = parsePhone(req.params.phone);
-    await svc.requireConversation(phone);
-    await svc.markRead(phone);
-    res.json({ ok: true });
-  })
-);
+  function done(r, message) {
+    if (!r.ok) return WC.fail(r);
+    if (message) WC.toast(message, "ok");
+    WC.afterChatAction();
+  }
 
-router.post(
-  "/conversations/:phone/takeover",
-  wrap(async (req, res) => {
-    await svc.takeOver(parsePhone(req.params.phone), req.staff);
-    res.json({ ok: true });
-  })
-);
+  function assign(phone, staffId) {
+    api("POST", "/conversations/" + phone + "/assign", { staff_id: staffId }).then(function (r) { done(r, staffId ? "Chat assigned." : "Chat unassigned."); });
+  }
 
-router.post(
-  "/conversations/:phone/handback",
-  wrap(async (req, res) => {
-    const result = await svc.handBack(parsePhone(req.params.phone));
-    res.json({ ok: true, ...result });
-  })
-);
+  function assignDialog(phone, conv) {
+    var select = h("select", { class: "input" }, h("option", { value: "" }, "Nobody (unassigned)"));
+    api("GET", "/team").then(function (r) {
+      (r.data.staff || []).forEach(function (u) { select.appendChild(h("option", { value: String(u.id) }, u.name)); });
+      select.value = conv.assigned_to ? String(conv.assigned_to) : "";
+    });
+    WC.dialog({
+      title: "Assign chat",
+      body: WC.field("Who is looking after this customer?", select),
+      actions: [
+        { label: "Cancel", kind: "ghost" },
+        { label: "Assign", onClick: function () { assign(phone, select.value ? Number(select.value) : null); } },
+      ],
+    });
+  }
 
-router.post(
-  "/conversations/:phone/resolve",
-  wrap(async (req, res) => {
-    const note = cleanText(req.body && req.body.note, 2000);
-    const result = await svc.resolve(parsePhone(req.params.phone), req.staff, note);
-    res.json({ ok: true, ...result });
-  })
-);
+  function markUnread(phone, selected) {
+    api("POST", "/conversations/" + phone + "/unread", {}).then(function (r) {
+      if (!r.ok) return WC.fail(r);
+      if (selected) WC.closeChat();
+      WC.toast("Marked as unread.", "ok");
+      WC.afterChatAction();
+    });
+  }
 
-router.post(
-  "/conversations/:phone/reopen",
-  wrap(async (req, res) => {
-    await svc.reopen(parsePhone(req.params.phone));
-    res.json({ ok: true });
-  })
-);
+  function pin(phone, pinned) {
+    api("POST", "/conversations/" + phone + "/pin", { pinned: pinned }).then(function (r) { done(r, pinned ? "Pinned to the top." : "Unpinned."); });
+  }
 
-router.patch(
-  "/conversations/:phone/customer",
-  wrap(async (req, res) => {
-    const phone = parsePhone(req.params.phone);
-    await svc.requireConversation(phone);
+  function exportChat(phone) {
+    api("GET", "/conversations/" + phone + "/export").then(function (r) {
+      if (!r.ok) return WC.fail(r);
+      var url = URL.createObjectURL(new Blob([r.data.text], { type: "text/plain;charset=utf-8" }));
+      var a = h("a", { href: url, download: r.data.filename, style: { display: "none" } });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    });
+  }
 
-    const body = req.body || {};
-    const displayName = cleanText(body.display_name, 150);
-    const notes = cleanText(body.notes, 5000);
+  // ---- clear view: hides messages on THIS device only, nothing is deleted ----
+  WC.clearedUpTo = function (phone) {
+    try { return Number(localStorage.getItem("wc_clear_" + phone)) || 0; } catch (e) { return 0; }
+  };
 
-    const sets = [];
-    const params = [];
-    if (displayName !== undefined) {
-      sets.push("display_name = ?");
-      params.push(displayName);
-    }
-    if (notes !== undefined) {
-      sets.push("notes = ?");
-      params.push(notes);
-    }
-    if (sets.length === 0) throw new HttpError(400, "Nothing to change.", "NO_CHANGES");
+  WC.showAllMessages = function (phone) {
+    try { localStorage.removeItem("wc_clear_" + phone); } catch (e) { /* ignore */ }
+    WC.rerenderMessages(false);
+  };
 
-    params.push(phone);
-    await db.run(`UPDATE customers SET ${sets.join(", ")} WHERE phone = ?`, params);
+  function clearView(phone) {
+    var msgs = S.chats.messages;
+    if (!msgs.length) return;
+    try { localStorage.setItem("wc_clear_" + phone, String(msgs[msgs.length - 1].id)); } catch (e) { /* ignore */ }
+    WC.rerenderMessages(true);
+    WC.toast("Earlier messages are hidden on this device. Nothing was deleted.", "ok");
+  }
 
-    const customer = await db.one(
-      "SELECT phone, whatsapp_name, display_name, notes FROM customers WHERE phone = ?",
-      [phone]
-    );
-    res.json({ customer });
-  })
-);
+  function resetMemory(phone) {
+    WC.confirm(
+      "Reset the bot's memory?",
+      "The bot will forget what it knows about this customer and start the conversation fresh. All messages, orders and notes stay exactly as they are.",
+      "Reset memory"
+    ).then(function (yes) {
+      if (!yes) return;
+      api("POST", "/conversations/" + phone + "/reset-bot-memory", {}).then(function (r) { done(r, "The bot's memory of this customer was reset."); });
+    });
+  }
 
-// ---------------------------------------------------------------------------
-// Phase 4: message and chat menu actions
-// ---------------------------------------------------------------------------
+  function deleteDialog(phone, conv) {
+    var also = h("input", { type: "checkbox" });
+    var typed = h("input", { class: "input", type: "text", placeholder: phone, autocomplete: "off" });
+    WC.dialog({
+      title: "Delete conversation",
+      body: [
+        h("p", null, "This permanently erases every message with ", h("b", null, conv.name || WC.phone(phone)), ", the bot's memory of them and their saved notes. It cannot be undone."),
+        h("label", { class: "check" }, also, " Also delete this customer's orders, appointments and tickets"),
+        WC.field("Type " + phone + " to confirm", typed),
+      ],
+      actions: [
+        { label: "Cancel", kind: "ghost" },
+        {
+          label: "Delete forever", kind: "danger",
+          onClick: function (dlg) {
+            return api("POST", "/conversations/" + phone + "/delete", { confirm: typed.value.trim(), also_records: also.checked }).then(function (r) {
+              if (!r.ok) { dlg.error((r.data && r.data.error) || "Could not delete."); return false; }
+              WC.toast("Conversation deleted.", "ok");
+              if (S.chats.selected === phone) WC.closeChat();
+              WC.refreshChatList();
+              WC.refreshSummary();
+              ["issues", "orders", "appointments"].forEach(function (k) { WC.refreshItems(k); });
+            });
+          },
+        },
+      ],
+    });
+  }
 
-function messageId(req) {
-  const id = intParam(req.params.id, null, 1, Number.MAX_SAFE_INTEGER);
-  if (!id) throw new HttpError(404, "Message not found.", "NOT_FOUND");
-  return id;
-}
-
-/** Names of active staff (for "assign to..."), visible to every signed-in staff member. */
-router.get(
-  "/team",
-  wrap(async (_req, res) => {
-    res.json({ staff: await db.all("SELECT id, name FROM staff_users WHERE active = 1 ORDER BY name") });
-  })
-);
-
-router.post(
-  "/messages/:id/react",
-  wrap(async (req, res) => {
-    const emoji = req.body && typeof req.body.emoji === "string" ? req.body.emoji : "";
-    res.json({ message: await svc.reactToMessage({ messageId: messageId(req), emoji }) });
-  })
-);
-
-router.post(
-  "/messages/:id/star",
-  wrap(async (req, res) => {
-    res.json({ message: await svc.setStarred(messageId(req), Boolean(req.body && req.body.starred)) });
-  })
-);
-
-router.post(
-  "/messages/:id/save-note",
-  wrap(async (req, res) => {
-    res.json({ notes: await svc.saveMessageToNotes(messageId(req)) });
-  })
-);
-
-router.post(
-  "/messages/:id/forward",
-  wrap(async (req, res) => {
-    const toPhone = parsePhone(req.body && req.body.to_phone, 400);
-    const result = await svc.forwardMessage({ messageId: messageId(req), toPhone, staff: req.staff });
-    if (!result.delivered) {
-      return res.status(502).json({ error: `WhatsApp did not accept the message: ${result.error}`, code: "SEND_FAILED", delivered: false });
-    }
-    res.status(201).json({ delivered: true });
-  })
-);
-
-router.post(
-  "/conversations/:phone/pin",
-  wrap(async (req, res) => {
-    await svc.setPinned(parsePhone(req.params.phone), Boolean(req.body && req.body.pinned));
-    res.json({ ok: true });
-  })
-);
-
-router.post(
-  "/conversations/:phone/unread",
-  wrap(async (req, res) => {
-    await svc.markUnread(parsePhone(req.params.phone));
-    res.json({ ok: true });
-  })
-);
-
-router.post(
-  "/conversations/:phone/assign",
-  wrap(async (req, res) => {
-    const raw = req.body ? req.body.staff_id : null;
-    const staffId = raw === null || raw === undefined || raw === "" ? null : intParam(raw, null, 1, Number.MAX_SAFE_INTEGER);
-    await svc.assignChat(parsePhone(req.params.phone), staffId);
-    res.json({ ok: true });
-  })
-);
-
-router.post(
-  "/conversations/:phone/reset-bot-memory",
-  wrap(async (req, res) => {
-    await svc.resetBotMemory(parsePhone(req.params.phone));
-    res.json({ ok: true });
-  })
-);
-
-router.get(
-  "/conversations/:phone/export",
-  wrap(async (req, res) => {
-    res.json(await svc.exportText(parsePhone(req.params.phone)));
-  })
-);
-
-/** Admin only. The body must repeat the phone number as a safety check. */
-router.post(
-  "/conversations/:phone/delete",
-  auth.requireAdmin,
-  wrap(async (req, res) => {
-    const phone = parsePhone(req.params.phone);
-    if (!req.body || req.body.confirm !== phone) {
-      throw new HttpError(400, "Type the phone number to confirm.", "CONFIRM_MISMATCH");
-    }
-    await svc.deleteConversation(phone, Boolean(req.body.also_records));
-    console.warn(`[admin] ${req.staff.email} permanently deleted the conversation with ${phone}` + (req.body.also_records ? " and its records." : "."));
-    res.json({ ok: true });
-  })
-);
-
-module.exports = router;
+  // ====================================================================
+  // Esc: cancel a reply, then close the open chat
+  // ====================================================================
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape" || document.querySelector(".overlay")) return;
+    var el = e.target;
+    if (S.chats.replyTo) { WC.setReply(null); return; }
+    if (el && el.closest && el.closest("input, textarea, select") && el.value) return;
+    if (S.tab === "chats" && S.chats.selected) WC.closeChat();
+  });
+})();

@@ -140,7 +140,22 @@
   // ====================================================================
   // App shell
   // ====================================================================
+  /** Dashboard files that did not load (missing upload, wrong folder, old cached copy). */
+  function missingFiles() {
+    return [["admin-chats.js", WC.buildChats], ["admin-items.js", WC.buildItems && WC.buildStaff], ["admin-products.js", WC.buildProducts], ["admin-menu.js", WC.menuLoaded]]
+      .filter(function (n) { return !n[1]; })
+      .map(function (n) { return n[0]; });
+  }
+
   function startApp() {
+    var missing = missingFiles();
+    if (missing.some(function (f) { return f !== "admin-menu.js"; })) {
+      authScreen(h("div", { class: "auth-card" },
+        h("span", { class: "brand-mark" }, "Wina ", h("em", null, "Classic")),
+        h("div", { class: "auth-eyebrow" }, "Shop Desk"),
+        h("div", { class: "auth-error" }, "Some dashboard files did not load: " + missing.join(", ") + ". Upload them to the public/admin folder of your app, then refresh with Ctrl+F5.")));
+      return;
+    }
     loggedOut = false;
     snapshot = null;
     S.summary = null;
@@ -177,7 +192,10 @@
     if (isAdmin) R.views.staff = h("div", { class: "view" }, WC.buildStaff());
     var main = h("main", { class: "main" }, Object.keys(R.views).map(function (k) { return R.views[k]; }));
 
-    setKids(document.getElementById("app"), [announce(), topbar, main]);
+    var notice = missing.length
+      ? h("div", { class: "notice" }, "Some dashboard files did not load (" + missing.join(", ") + "), so some features are switched off. Upload them to public/admin and refresh with Ctrl+F5.")
+      : null;
+    setKids(document.getElementById("app"), [announce(), topbar, notice, main]);
     WC.showTab("chats");
 
     WC.loadChats(true);

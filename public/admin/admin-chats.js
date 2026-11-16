@@ -10,6 +10,11 @@
     ["window_open", "Window open"], ["open_issue", "Open issue"], ["resolved", "Resolved"], ["all", "All"],
   ];
 
+  // If admin-menu.js did not load, the chats still work, just without the right-click menus.
+  // (When it does load, it replaces these placeholders.)
+  ["attachChatMenu", "chatMenu", "messageMenu", "longPress", "closeMenu"].forEach(function (n) { WC[n] = WC[n] || function () {}; });
+  WC.recentTouchOpen = WC.recentTouchOpen || function () { return false; };
+
   var listReq = 0; // lets us ignore answers that arrive after a newer request
   var threadReq = 0;
   var sending = false;
@@ -121,8 +126,15 @@
 
   function renderChatList() {
     var cs = S.chats, rows = R.chats.rows, top = rows.scrollTop;
-    if (!cs.items.length) setKids(rows, [h("div", { class: "list-empty" }, emptyListText())]);
-    else setKids(rows, cs.items.map(chatRow));
+    try {
+      if (!cs.items.length) setKids(rows, [h("div", { class: "list-empty" }, emptyListText())]);
+      else setKids(rows, cs.items.map(chatRow));
+    } catch (err) {
+      setKids(rows, [h("div", { class: "list-empty" },
+        h("p", null, h("b", null, "The chats loaded but could not be shown.")),
+        h("p", { class: "muted" }, String(err && err.message ? err.message : err)),
+        h("p", { class: "muted" }, "A dashboard file may be missing or out of date. Re-upload the files in public/admin and refresh."))]);
+    }
     rows.scrollTop = top;
     R.chats.more.classList.toggle("hidden", !cs.hasMore);
   }
