@@ -168,6 +168,25 @@ router.get(
     const c = creds();
     const row = await db.one("SELECT * FROM whatsapp_connection WHERE id = 1");
 
+    // Does Meta accept this App ID + App secret pair? (Tested without a login code,
+    // so a wrong secret is found here instead of after a popup run.)
+    let credentials = { ok: false, detail: "not checked" };
+    if (c.missing.length === 0) {
+      try {
+        await graph("GET", "/oauth/access_token", {
+          params: { client_id: c.appId, client_secret: c.appSecret, grant_type: "client_credentials" },
+        });
+        credentials = { ok: true };
+      } catch (err) {
+        credentials = {
+          ok: false,
+          detail: err.message,
+          // an app secret is 32 hex characters; spaces or quotes break that
+          secretFormatOk: /^[0-9a-f]{32}$/i.test(c.appSecret),
+        };
+      }
+    }
+
     let live = null;
     if (row) {
       try {
@@ -190,6 +209,7 @@ router.get(
       graphVersion: GRAPH_VERSION,
       ready: c.missing.length === 0,
       missing: c.missing,
+      credentials,
       source: whatsapp.getConnectionSource(),
       connection: row ? publicConnection(row) : null,
       live,
@@ -230,7 +250,9 @@ router.post(
       if (t.expires_in) expiresAt = new Date(Date.now() + Number(t.expires_in) * 1000);
       step("Exchanged the code for an access token", true);
     } catch (err) {
-      throw new HttpError(502, `Meta refused the authorization code: ${err.message}`, "META_TOKEN");
+      console.error("[whatsapp] Onboarding: code exchange failed:", err.message);
+      // 424, not 5xx: the catch-all handler in server.js hides the message of 5xx errors.
+      throw new HttpError(424, `Meta refused the authorization code: ${err.message}`, "META_TOKEN");
     }
 
     // 2) which account / number?
@@ -241,7 +263,8 @@ router.post(
         phoneNumberId = found.phoneNumberId;
         step("Worked out the account and number from the token", true);
       } catch (err) {
-        throw new HttpError(502, err.message, "META_DISCOVER");
+        console.error("[whatsapp] Onboarding: could not find the account/number:", err.message);
+        throw new HttpError(424, `Could not identify the WhatsApp number: ${err.message}`, "META_DISCOVER");
       }
     }
 

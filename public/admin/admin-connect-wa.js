@@ -36,8 +36,9 @@
     d.appendChild(el("span", "v", value));
     return d;
   }
+  function credsOk() { return !!(cfg && cfg.credentials && cfg.credentials.ok); }
   function refresh() {
-    $("connect").disabled = busy || !sdkReady || !cfg || !cfg.ready || !$("agree").checked;
+    $("connect").disabled = busy || !sdkReady || !cfg || !cfg.ready || !credsOk() || !$("agree").checked;
   }
   function setBusy(v) {
     busy = v;
@@ -91,6 +92,14 @@
       else if (live && live.onBusinessApp === true) text = "yes, coexistence is active";
       else if (live && live.onBusinessApp === false) text = "NO, the app is no longer linked";
       box.appendChild(row("Business app still linked", text));
+    }
+    var cr = d.credentials;
+    if (cr) {
+      var crText = cr.ok ? "accepted by Meta" : "rejected by Meta: " + (cr.detail || "unknown reason");
+      if (!cr.ok && cr.secretFormatOk === false) {
+        crText += ". The saved secret does not look like a 32-character app secret; check for spaces or quotes.";
+      }
+      box.appendChild(row("App ID and app secret", crText));
     }
     $("resync").hidden = !c;
     $("disconnect").hidden = !c;
@@ -213,6 +222,9 @@
       $("actions").hidden = false;
       if (!cfg.ready) {
         note("Missing environment variables: " + cfg.missing.join(", "), "error");
+      } else if (!cfg.credentials || !cfg.credentials.ok) {
+        note("Meta does not accept the App ID and app secret saved in cPanel. Fix them, restart the app and reload this page. The Connect button stays off until Meta accepts them.", "error");
+        if (first) loadSdk();
       } else if (first) {
         loadSdk();
       }
