@@ -9,6 +9,18 @@
  * Meta retries the webhook if we take more than a few seconds, so we send
  * HTTP 200 immediately and process the message in the background.
  *
+ * CHANGES FOR COEXISTENCE (connecting the shop's real WhatsApp number)
+ * --------------------------------------------------------------------
+ * - /api/whatsapp/*              admin API used by the Connect WhatsApp page
+ * - /admin/connect-whatsapp.html the Connect page (own, slightly wider
+ *                                security policy: it needs Facebook's SDK)
+ * - Coexistence webhook events (history, smb_message_echoes,
+ *   smb_app_state_sync) are stored raw in wa_raw_events. Messages the shop
+ *   sends from the phone are saved as staff messages and switch that chat to
+ *   human mode, so the bot does not talk over staff.
+ * - The saved WhatsApp connection (token + phone number id) is loaded from
+ *   the database at boot.
+ *
  * CHANGES IN PHASE 2 (dashboard API)
  * -----------------------------------
  * - /api/*    the staff dashboard API (login, chats, replies, orders...)
@@ -42,6 +54,7 @@ const db = require("./db.js");
 const { ensureSchema } = require("./schema.js");
 const path = require("path");
 const { createApiRouter } = require("./routes/index.js");
+const whatsappOnboard = require("./routes/whatsappOnboard.js");
 
 const VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 
@@ -93,8 +106,9 @@ const app = express();
 // Keep query keys as Meta sends them: hub.mode, hub.verify_token, hub.challenge.
 app.set("query parser", "simple");
 
-// Parse JSON bodies from Meta.
-app.use(express.json({ limit: "2mb" }));
+// Parse JSON bodies from Meta. (10mb: chat-history chunks from a Coexistence
+// sync can be larger than ordinary webhooks.)
+app.use(express.json({ limit: "10mb" }));
 
 // ---------------------------------------------------------------------------
 // Routing note for this specific host (cPanel + LiteSpeed Node.js Selector)
@@ -182,6 +196,35 @@ function adminHeaders(_req, res, next) {
   next();
 }
 
+// The Connect WhatsApp page needs Facebook's SDK, so it gets its own, slightly
+// wider policy. Everything else under /admin keeps the strict one above.
+function connectPageHeaders(_req, res, next) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; " +
+      "script-src 'self' https://connect.facebook.net; " +
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+      "font-src https://fonts.gstatic.com; " +
+      "img-src 'self' data: https://www.facebook.com; " +
+      "connect-src 'self' https://www.facebook.com https://web.facebook.com https://graph.facebook.com; " +
+      "frame-src https://www.facebook.com https://web.facebook.com https://staticxx.facebook.com; " +
+      "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+  );
+  next();
+}
+
+router.get("/admin/connect-whatsapp.html", connectPageHeaders, (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "admin", "connect-whatsapp.html"));
+});
+
+// Must come BEFORE the general /api router below.
+router.use("/api/whatsapp", whatsappOnboard.router);
+
 router.use("/api", createApiRouter());
 router.use("/admin", adminHeaders, express.static(path.join(__dirname, "public", "admin")));
 
@@ -233,7 +276,75 @@ function enqueueForPhone(phone, task) {
   return next;
 }
 
+// ---------------------------------------------------------------------------
+// Coexistence events (the shop's number is on the Business app AND the API)
+// ---------------------------------------------------------------------------
+const COEX_FIELDS = new Set(["history", "smb_message_echoes", "smb_app_state_sync"]);
+
+/**
+ * Messages the shop sent from the phone (the WhatsApp Business app). Saved as
+ * staff messages; the chat switches to human mode so the bot stays silent.
+ */
+async function handleEchoes(value) {
+  for (const echo of (value && value.message_echoes) || []) {
+    const phone = String(echo.to || "").replace(/\D/g, "");
+    if (!phone || !echo.id) continue;
+
+    let body = "";
+    if (echo.type === "text") {
+      body = (echo.text && echo.text.body) || "";
+    } else {
+      const caption = echo[echo.type] && echo[echo.type].caption;
+      body = `[Sent from the Business app: ${echo.type}${caption ? " - " + caption : ""}]`;
+    }
+
+    try {
+      const saved = await chatStore.recordStaffEcho({
+        phone,
+        body,
+        waMessageId: echo.id,
+        timestamp: echo.timestamp,
+        msgType: echo.type,
+      });
+      if (!saved.duplicate) {
+        trace(echo.id, `staff replied from the phone to ${phone} - chat switched to human mode`);
+      }
+    } catch (err) {
+      console.error("[coex] Could not save a staff echo:", err.message);
+    }
+  }
+}
+
+/**
+ * History arrives only once and cannot be replayed, so every coexistence
+ * event is stored untouched in wa_raw_events first. A later step imports the
+ * history from there into the chat tables.
+ */
+function captureCoexistenceEvents(body) {
+  for (const entry of (body && body.entry) || []) {
+    for (const change of entry.changes || []) {
+      if (!COEX_FIELDS.has(change.field)) continue;
+
+      const json = JSON.stringify(change.value || {});
+      console.error(`[coex] ${change.field} event received (${json.length} bytes)`);
+      db.run(
+        "INSERT INTO wa_raw_events (field, payload, received_at) VALUES (?, ?, ?)",
+        [change.field, json, new Date()]
+      ).catch((err) => console.error("[coex] Could not save a raw event:", err.message));
+
+      if (change.field === "smb_message_echoes") {
+        handleEchoes(change.value).catch((err) =>
+          console.error("[coex] Echo handling failed:", err.message)
+        );
+      }
+    }
+  }
+}
+
 async function processWebhook(body) {
+  // 0) Coexistence events (history, contacts, staff replies from the phone).
+  captureCoexistenceEvents(body);
+
   // 1) Delivery receipts for messages WE sent. These do not need the
   //    per-customer queue; update them in the background.
   for (const update of parseStatusUpdates(body)) {
@@ -480,6 +591,10 @@ app.listen(() => {
       // console.error on purpose: stderr.log is the file this host keeps
       if (added && added.length) console.error("[boot] Database upgraded automatically. Added: " + added.join(", ") + ".");
     })
+    // If the shop's number was connected on the Connect WhatsApp page, hand its
+    // saved token and phone number id to whatsapp.js (otherwise the test number
+    // from the environment variables stays in use).
+    .then(() => whatsappOnboard.applyStoredConnection())
     .catch((err) =>
       console.error(
         "[boot] DATABASE CONNECTION FAILED:",

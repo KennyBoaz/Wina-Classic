@@ -44,6 +44,34 @@ const TABLES = [
      KEY idx_prod_active (active, category),
      KEY idx_prod_name (name)
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  // The shop's real WhatsApp number, connected through Embedded Signup
+  // (Coexistence). One row only (id = 1). Holds the access token.
+  `CREATE TABLE IF NOT EXISTS whatsapp_connection (
+     id               TINYINT UNSIGNED NOT NULL,
+     waba_id          VARCHAR(40) NOT NULL,
+     phone_number_id  VARCHAR(40) NOT NULL,
+     display_phone    VARCHAR(40) NULL,
+     verified_name    VARCHAR(190) NULL,
+     access_token     TEXT NOT NULL,
+     token_expires_at DATETIME(3) NULL,
+     mode             VARCHAR(20) NOT NULL DEFAULT 'coexistence',
+     connected_by     INT UNSIGNED NULL,
+     connected_at     DATETIME(3) NOT NULL,
+     updated_at       DATETIME(3) NOT NULL,
+     PRIMARY KEY (id)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  // Raw coexistence webhook payloads (chat history, contacts, staff replies
+  // from the phone). History arrives only once, so it is stored untouched
+  // first and imported into the chat tables afterwards.
+  `CREATE TABLE IF NOT EXISTS wa_raw_events (
+     id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     field        VARCHAR(40) NOT NULL,
+     payload      MEDIUMTEXT NOT NULL,
+     received_at  DATETIME(3) NOT NULL,
+     processed_at DATETIME(3) NULL,
+     PRIMARY KEY (id),
+     KEY idx_raw_field (field, processed_at)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 ];
 
 // Columns added in later phases: [table, column, definition]

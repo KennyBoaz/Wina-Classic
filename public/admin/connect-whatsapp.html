@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Connect WhatsApp - Wina Classic Shop Desk</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600&amp;family=Poppins:wght@400;500;600&amp;display=swap">
+  <style>
+    [hidden] { display: none !important; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #efe6da; color: #1d1d1d; font: 14px/1.55 Poppins, system-ui, sans-serif; }
+    main { max-width: 660px; margin: 0 auto; padding: 32px 16px 64px; }
+    h1 { font: 600 36px/1.1 "Cormorant Garamond", Georgia, serif; color: #243b32; margin: 0 0 6px; }
+    .lead { margin: 0 0 20px; color: #5b5448; }
+    .panel { background: #fff; border-radius: 10px; padding: 18px 20px; margin: 14px 0; border: 1px solid #ddd2c2; }
+    .kv { display: flex; gap: 12px; padding: 5px 0; border-bottom: 1px solid #f0e9de; }
+    .kv:last-child { border-bottom: 0; }
+    .k { width: 190px; flex: none; color: #6b6354; }
+    .v { word-break: break-word; }
+    .check { display: flex; gap: 10px; align-items: flex-start; margin: 14px 0; }
+    .check input { margin-top: 4px; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+    button { font: 500 14px Poppins, sans-serif; border-radius: 8px; padding: 11px 18px; cursor: pointer; border: 1px solid #8a6d2f; background: #8a6d2f; color: #fff; }
+    button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid #243b32; outline-offset: 2px; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.ghost { background: transparent; color: #1d1d1d; border-color: #b9ab94; }
+    .note { padding: 11px 14px; border-radius: 8px; background: #f3ecdf; margin: 14px 0; }
+    .note.error { background: #f9e0df; color: #7a1f1f; }
+    .note.ok { background: #e0efe3; color: #1f4a2b; }
+    ul.steps { list-style: none; padding: 0; margin: 14px 0 0; }
+    ul.steps li { padding: 4px 0; }
+    ul.steps li.bad { color: #a12a2a; }
+    small { color: #6b6354; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Connect WhatsApp</h1>
+  <p class="lead">Link the shop's WhatsApp Business app number so the bot can answer on it, while staff keep using the app on the phone.</p>
+
+  <div class="panel" id="status">Loading...</div>
+  <div class="note" id="note" hidden></div>
+
+  <div class="panel" id="actions" hidden>
+    <p><strong>Before you connect.</strong> Back up the chats on the phone (WhatsApp Business, Settings, Chats, Chat backup). Chat history is imported only once, so when the popup asks, choose to share the chat history.</p>
+    <label class="check">
+      <input type="checkbox" id="agree">
+      <span>I have a backup, and I will choose to share chat history in the popup.</span>
+    </label>
+    <div class="row">
+      <button id="connect" type="button" disabled>Connect the Business app number</button>
+      <button id="resync" type="button" class="ghost" hidden>Request contacts and history again</button>
+      <button id="disconnect" type="button" class="ghost" hidden>Remove saved connection</button>
+    </div>
+    <ul class="steps" id="steps"></ul>
+  </div>
+</main>
+<script src="admin-connect-wa.js"></script>
+</body>
+</html>

@@ -18,6 +18,14 @@
  *   (connection refused / DNS failure) or Meta answered with a 5xx error.
  *   Timeouts are NOT retried, to avoid sending the customer the same
  *   message twice.
+ *
+ * CHANGES FOR COEXISTENCE
+ * -----------------------
+ * - setConnection() / getConnectionSource(): once the shop's real number is
+ *   connected through Embedded Signup, its token and phone number id are
+ *   saved in the database (table whatsapp_connection) and handed to this
+ *   file at boot. When set, they win over WHATSAPP_TOKEN and
+ *   WHATSAPP_PHONE_NUMBER_ID from the environment (the test number).
  */
 
 const axios = require("axios");
@@ -41,7 +49,28 @@ const graph = axios.create({
   headers: { "Content-Type": "application/json" },
 });
 
+// Set at runtime from the database after the shop connects its number.
+// While it is null, the environment variables (the test number) are used.
+let runtimeConnection = null;
+
+function setConnection(conn) {
+  runtimeConnection =
+    conn && conn.token && conn.phoneNumberId
+      ? { token: conn.token, phoneNumberId: conn.phoneNumberId }
+      : null;
+}
+
+/** "database" (connected shop number), "env" (test number) or "none". */
+function getConnectionSource() {
+  if (runtimeConnection) return "database";
+  return process.env.WHATSAPP_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID
+    ? "env"
+    : "none";
+}
+
 function getConfig() {
+  if (runtimeConnection) return runtimeConnection;
+
   const token = process.env.WHATSAPP_TOKEN;
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
 
@@ -338,6 +367,8 @@ function logWhatsAppError(err, to) {
     console.error("  Replies are NOT reaching customers until you replace it.");
     console.error("  Fix: create a System User token in Meta Business Settings");
     console.error("  (never-expiring), update .env, then restart the app.");
+    console.error("  (If the shop number was connected on the Connect WhatsApp");
+    console.error("  page, reconnect it there to get a fresh token.)");
     console.error("============================================================");
     console.error(`[whatsapp] Failed to send to ${to}:`, JSON.stringify(data, null, 2));
     return;
@@ -386,6 +417,8 @@ async function sendWhatsAppReaction(to, messageId, emoji) {
 }
 
 module.exports = {
+  setConnection,
+  getConnectionSource,
   sendWhatsAppReaction,
   parseIncomingMessages,
   parseStatusUpdates,

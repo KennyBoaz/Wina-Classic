@@ -6,6 +6,9 @@
  *
  *   recordIncoming()      save a customer's message, update the chat summary
  *   recordOutgoing()      save a message we sent (bot now, staff in Phase 2)
+ *   recordStaffEcho()     save a message the shop sent from the WhatsApp
+ *                         Business app on the phone (Coexistence), and put the
+ *                         chat in human mode
  *   applyStatusUpdate()   sent / delivered / read / failed ticks from Meta
  *   getConversation()     the chat's current mode/status row
  *   markEscalated()       flag a chat as needing a human
@@ -162,6 +165,46 @@ async function recordOutgoing({
 }
 
 /**
+ * A message the shop sent from the WhatsApp Business APP on the phone (a
+ * Coexistence "echo"). Saved as a staff message, and the chat switches to
+ * human mode so the bot does not talk over the person who just answered.
+ * Returns { duplicate: true } if this message id is already stored (for
+ * example a message the bot itself sent); nothing is changed in that case.
+ */
+async function recordStaffEcho({ phone, body, waMessageId, timestamp, msgType = "text" }) {
+  await ensureCustomer(phone, null);
+
+  const createdAt = fromWhatsAppTimestamp(timestamp);
+  try {
+    await db.run(
+      `INSERT INTO messages
+         (phone, direction, sender_type, msg_type, body, wa_message_id, delivery_status, created_at)
+       VALUES (?, 'out', 'staff', ?, ?, ?, 'sent', ?)`,
+      [phone, clip(msgType, 20) || "text", body || "", clip(waMessageId, 128), createdAt]
+    );
+  } catch (err) {
+    if (err && err.code === "ER_DUP_ENTRY") return { duplicate: true };
+    throw err;
+  }
+
+  await db.run(
+    `UPDATE conversations
+        SET last_message_at = ?, last_message_preview = ?
+      WHERE phone = ? AND (last_message_at IS NULL OR last_message_at <= ?)`,
+    [createdAt, makePreview(body), phone, createdAt]
+  );
+
+  await db.run(
+    `UPDATE conversations
+        SET mode = 'human', human_since = UTC_TIMESTAMP(3)
+      WHERE phone = ? AND mode = 'bot'`,
+    [phone]
+  );
+
+  return { duplicate: false };
+}
+
+/**
  * Apply a delivery receipt from Meta (sent / delivered / read / failed).
  * Ticks only move forward (a late "delivered" never overwrites "read").
  * Meta can send the receipt a moment before our own insert finishes, so if
@@ -234,6 +277,7 @@ module.exports = {
   getConversation,
   recordIncoming,
   recordOutgoing,
+  recordStaffEcho,
   applyStatusUpdate,
   markEscalated,
   makePreview,
