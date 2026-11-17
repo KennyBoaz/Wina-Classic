@@ -33,6 +33,7 @@ class MetaError extends Error {
     const detail = e && e.error_data && e.error_data.details;
     super(e ? `${e.message}${detail ? " - " + detail : ""}` : String(err.code || err.message));
     this.metaCode = e ? e.code : undefined;
+    this.metaSubcode = e ? e.error_subcode : undefined;
     this.httpStatus = err.response ? err.response.status : undefined;
   }
 }
@@ -51,6 +52,39 @@ async function graph(method, path, { params, data, token } = {}) {
   } catch (err) {
     throw new MetaError(err); // message only: never logs tokens or the app secret
   }
+}
+
+/**
+ * Exchange the login code for a business token.
+ * A code from FB.login (JavaScript SDK) is tied to the SDK's own, EMPTY redirect
+ * URI, and Meta rejects the exchange (error 100 / subcode 36008) when the field
+ * is simply left out. So: try an explicit blank redirect_uri first, then none,
+ * then the page address. Only a 36008 triggers the next variant.
+ */
+async function exchangeCode(appId, appSecret, code, pageUrl) {
+  const attempts = [
+    { label: "blank redirect_uri", extra: { redirect_uri: "" } },
+    { label: "no redirect_uri", extra: {} },
+  ];
+  if (pageUrl) attempts.push({ label: "page address", extra: { redirect_uri: pageUrl } });
+
+  let lastErr;
+  for (const a of attempts) {
+    try {
+      const t = await graph("GET", "/oauth/access_token", {
+        params: { client_id: appId, client_secret: appSecret, code, ...a.extra },
+      });
+      console.error(`[whatsapp] Code exchange worked with: ${a.label}`);
+      return t;
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `[whatsapp] Code exchange (${a.label}) failed: ${err.message} [${err.metaCode || "?"}/${err.metaSubcode || "?"}]`
+      );
+      if (err.metaSubcode !== 36008) break;
+    }
+  }
+  throw lastErr;
 }
 
 function creds() {
@@ -233,6 +267,8 @@ router.post(
     if (!code || code.length > 2000) {
       throw new HttpError(400, "Missing the authorization code from Meta.", "BAD_REQUEST");
     }
+    const rawPage = String((req.body && req.body.pageUrl) || "");
+    const pageUrl = /^https:\/\/[^\s"'<>]{1,300}$/.test(rawPage) ? rawPage : "";
     let wabaId = digits(req.body.wabaId);
     let phoneNumberId = digits(req.body.phoneNumberId);
 
@@ -243,9 +279,7 @@ router.post(
     let token;
     let expiresAt = null;
     try {
-      const t = await graph("GET", "/oauth/access_token", {
-        params: { client_id: c.appId, client_secret: c.appSecret, code },
-      });
+      const t = await exchangeCode(c.appId, c.appSecret, code, pageUrl);
       token = t.access_token;
       if (t.expires_in) expiresAt = new Date(Date.now() + Number(t.expires_in) * 1000);
       step("Exchanged the code for an access token", true);

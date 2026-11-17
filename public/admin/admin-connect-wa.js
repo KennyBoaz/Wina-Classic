@@ -6,7 +6,8 @@
 
   var BASE = location.pathname.replace(/\/admin\/[^/]*$/, "");
   var API = BASE + "/api/whatsapp";
-  var FB_ORIGINS = ["https://www.facebook.com", "https://web.facebook.com"];
+  // Meta's popup can post from www., web. or business.facebook.com
+  var FB_ORIGIN = /^https:\/\/([a-z0-9-]+\.)*facebook\.com$/;
 
   var csrf = "";
   var cfg = null;
@@ -126,10 +127,12 @@
   // Meta sends the chosen account and number in a window message, around the
   // same time as the login callback. Either can arrive first.
   window.addEventListener("message", function (event) {
-    if (FB_ORIGINS.indexOf(event.origin) === -1) return;
+    if (!FB_ORIGIN.test(event.origin)) return;
     var data;
     try { data = JSON.parse(event.data); } catch (e) { return; }
     if (!data || data.type !== "WA_EMBEDDED_SIGNUP") return;
+    // Shown in the browser console (F12) to help diagnose a signup that stalls.
+    console.log("WA_EMBEDDED_SIGNUP", event.origin, data.event, data.data);
 
     if (/^FINISH/.test(String(data.event))) {
       session = data.data || {};
@@ -184,6 +187,7 @@
     note("Finishing setup on the server. Keep this page open.");
     var payload = {
       code: authCode,
+      pageUrl: location.href.split("#")[0],
       wabaId: (session && session.waba_id) || "",
       phoneNumberId: (session && session.phone_number_id) || ""
     };
