@@ -68,7 +68,7 @@ async function exchangeCode(appId, appSecret, code, pageUrl) {
   ];
   if (pageUrl) attempts.push({ label: "page address", extra: { redirect_uri: pageUrl } });
 
-  let lastErr;
+  let firstErr;
   for (const a of attempts) {
     try {
       const t = await graph("GET", "/oauth/access_token", {
@@ -77,14 +77,15 @@ async function exchangeCode(appId, appSecret, code, pageUrl) {
       console.error(`[whatsapp] Code exchange worked with: ${a.label}`);
       return t;
     } catch (err) {
-      lastErr = err;
+      // Report the FIRST failure: later variants are guesses and their errors can mislead.
+      if (!firstErr) firstErr = err;
       console.error(
         `[whatsapp] Code exchange (${a.label}) failed: ${err.message} [${err.metaCode || "?"}/${err.metaSubcode || "?"}]`
       );
       if (err.metaSubcode !== 36008) break;
     }
   }
-  throw lastErr;
+  throw firstErr;
 }
 
 function creds() {
