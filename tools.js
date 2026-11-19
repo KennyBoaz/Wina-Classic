@@ -24,6 +24,7 @@
 const { Type } = require("@google/genai");
 const db = require("./db.js");
 const chatStore = require("./chatStore.js");
+const { notifyTeam } = require("./alerts.js");
 
 const PAUSE_BOT_ON_ESCALATION =
   String(process.env.PAUSE_BOT_ON_ESCALATION || "false").toLowerCase() === "true";
@@ -244,6 +245,11 @@ async function book_appointment(
     ]
   );
 
+  notifyTeam({
+    type: "appointment", phone: ctx.phone, name: name || ctx.customerName,
+    title: "New appointment request", text: `${date} at ${when}${purpose ? " - " + purpose : ""}`,
+  }).catch(() => {});
+
   return {
     success: true,
     appointment_id: ref,
@@ -365,6 +371,11 @@ async function create_order(
     ]
   );
 
+  notifyTeam({
+    type: "order", phone: ctx.phone, name: customer_name || ctx.customerName,
+    title: "New order", text: itemList.join(", ") + (quantity ? ` (qty ${quantity})` : ""),
+  }).catch(() => {});
+
   return {
     success: true,
     order_ref: ref,
@@ -455,6 +466,11 @@ async function escalate_to_human({ reason, conversation_summary } = {}, ctx = {}
   console.log(`  Summary       : ${conversation_summary}`);
   console.log(`  Bot paused    : ${PAUSE_BOT_ON_ESCALATION && ctx.phone ? "yes" : "no"}`);
   console.log("============================================================");
+
+  notifyTeam({
+    type: "escalation", phone: ctx.phone, name: ctx.customerName,
+    title: "Customer needs a person", text: [reason, conversation_summary].filter(Boolean).join("\n"),
+  }).catch(() => {});
 
   return {
     success: true,

@@ -51,6 +51,8 @@ const { generateReply } = require("./gemini.js");
 const { getHistory, saveHistory } = require("./memory.js");
 const chatStore = require("./chatStore.js");
 const db = require("./db.js");
+const mediaStore = require("./media.js");
+const { notifyTeam } = require("./alerts.js");
 const { ensureSchema } = require("./schema.js");
 const path = require("path");
 const { createApiRouter } = require("./routes/index.js");
@@ -190,7 +192,7 @@ function adminHeaders(_req, res, next) {
     "Content-Security-Policy",
     "default-src 'self'; script-src 'self'; " +
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
-      "font-src https://fonts.gstatic.com; img-src 'self' data: https://winaclassic.ug; " +
+      "font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://winaclassic.ug; " +
       "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
   );
   next();
@@ -438,6 +440,11 @@ async function handleIncomingMessage(message) {
       return;
     }
     conversation = saved.conversation;
+    // a photo / voice note / document: download it now (WhatsApp links expire) and keep it privately
+    if (message.media && saved.messageId) {
+      mediaStore.attach(saved.messageId, from, message.media).catch((err) =>
+        console.error("[media] Could not save the customer's file:", err.message));
+    }
   } catch (err) {
     console.error(
       "[db] Could not save the incoming message. The bot will still reply:",
@@ -503,6 +510,7 @@ async function handleIncomingMessage(message) {
     } catch (flagErr) {
       console.error("[db] Could not flag the chat for staff:", flagErr.message);
     }
+    notifyTeam({ type: "escalation", phone: from, name, title: "The bot could not answer a customer", text: err.message }).catch(() => {});
     return;
   }
   const { reply, updatedHistory } = result;
@@ -574,6 +582,7 @@ function warnIfMissingEnv() {
 // to app.listen(PORT, ...) with const PORT = Number(process.env.PORT) || 3000;
 app.listen(() => {
   warnIfMissingEnv();
+  mediaStore.startCleanup();
   console.log("Wina Classic WhatsApp bot listening (LiteSpeed-managed socket)");
   console.log(`Webhook URL path: /webhook`);
   console.log(

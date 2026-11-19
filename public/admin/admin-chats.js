@@ -48,7 +48,9 @@
       rows: 1, placeholder: "Type a message", "aria-label": "Message", onKeydown: onComposerKey, onInput: autoGrow,
     });
     c.send = h("button", { class: "send-btn", type: "button", "aria-label": "Send message", onClick: sendMessage }, icon("send"));
-    c.composer = h("footer", { class: "composer" }, c.input, c.send);
+    c.attach = h("button", { class: "icon-btn attach", type: "button", "aria-label": "Attach a file", title: "Attach a photo or document", onClick: function () { if (WC.pickFile) WC.pickFile(); } }, icon("paperclip"));
+    c.tpl = h("button", { class: "btn small gold hidden", type: "button", onClick: function () { if (WC.templateDialog) WC.templateDialog(); } }, icon("chat"), "Send a template");
+    c.composer = h("footer", { class: "composer" }, c.attach, c.tpl, c.input, c.send);
     c.replybar = h("div", { class: "replybar hidden" });
     c.box = h("div", { class: "thread-box hidden" }, c.head, c.alert, c.scroll, c.modebar, c.replybar, c.composer);
     c.empty = h("div", { class: "thread-empty" },
@@ -377,7 +379,11 @@
       more,
       out ? h("div", { class: "sender" }, kind === "bot" ? "Bot" : (m.staff_name || "Team")) : null,
       quoteBlock(m),
-      h("div", { class: "text" + (isMedia ? " media" : "") }, WC.linkify(body)),
+      WC.mediaBlock ? WC.mediaBlock(m) : null,
+      (function () {
+        var shown = (m.has_media && WC.mediaCaption) ? WC.mediaCaption(m) : body;
+        return shown ? h("div", { class: "text" + (isMedia && !m.has_media ? " media" : "") }, WC.linkify(shown)) : null;
+      })(),
       h("div", { class: "meta" },
         m.starred ? h("span", { class: "star", title: "Starred" }, icon("star")) : null,
         h("span", { class: "time" }, fmt.time(m.created_at)),
@@ -538,6 +544,8 @@
     var blocked = !conv || !win.open;
     c.input.disabled = blocked;
     c.send.disabled = blocked || sending;
+    c.attach.disabled = blocked;
+    c.tpl.classList.toggle("hidden", !(conv && blocked));
     c.input.placeholder = !conv ? "Loading..." : blocked ? "The 24-hour window has closed. Free-form replies are not allowed." : "Type a message";
   }
 

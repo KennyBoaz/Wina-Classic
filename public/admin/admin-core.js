@@ -21,6 +21,7 @@
   // Works whether the app is reached at /admin/... or /winaclassic/admin/...
   var BASE = location.pathname.replace(/\/admin\/[^/]*$/, "");
   var API = BASE + "/api";
+  WC.apiBase = API;
 
   // ------------------------------------------------------------------
   // Shared state and element references
@@ -117,6 +118,8 @@
     refresh: '<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>',
     unread: '<path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>',
     tag: '<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>',
+    paperclip: '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+    file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
   };
 
   WC.icon = function (name) {
@@ -295,6 +298,22 @@
         setLive(false);
         return { ok: false, status: 0, data: { error: "Can't reach the server. Check your internet connection." } };
       }
+    );
+  };
+
+  /** Send a file as raw bytes (not JSON). Same result shape as WC.api. */
+  WC.upload = function (path, file, headers) {
+    return fetch(API + path, {
+      method: "POST", credentials: "same-origin", body: file,
+      headers: Object.assign({ "Content-Type": file.type || "application/octet-stream", "X-CSRF-Token": S.csrf || "", "X-Upload": "1" }, headers || {}),
+    }).then(
+      function (res) {
+        return res.json().catch(function () { return {}; }).then(function (data) {
+          if (res.status === 401 && WC.onUnauthorized) WC.onUnauthorized();
+          return { ok: res.ok, status: res.status, data: data || {} };
+        });
+      },
+      function () { return { ok: false, status: 0, data: { error: "Can't reach the server. Check your internet connection." } }; }
     );
   };
 
