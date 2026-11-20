@@ -205,6 +205,59 @@ async function recordStaffEcho({ phone, body, waMessageId, timestamp, msgType = 
 }
 
 /**
+ * Save a photo / video / audio / document a staff member sent from the dashboard.
+ * The file itself is stored by media.js under this message's id.
+ * Returns the new message id.
+ */
+async function recordOutgoingMedia({
+  phone, body, msgType = "document", mime, name, size,
+  staffId = null, waMessageId = null, status = "sent", error = null,
+}) {
+  await ensureCustomer(phone, null);
+
+  const insert = await db.run(
+    `INSERT INTO messages
+       (phone, direction, sender_type, staff_id, msg_type, body, wa_message_id,
+        delivery_status, error_text, has_media, media_mime, media_name, media_size, created_at)
+     VALUES (?, 'out', 'staff', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, UTC_TIMESTAMP(3))`,
+    [phone, staffId, clip(msgType, 20) || "document", body || "", clip(waMessageId, 128),
+     status, clip(error, 500), clip(mime, 100), clip(name, 255), Number(size) || null]
+  );
+
+  await db.run(
+    `UPDATE conversations
+        SET last_message_at = UTC_TIMESTAMP(3), last_message_preview = ?
+      WHERE phone = ?`,
+    [makePreview(body), phone]
+  );
+  return insert.insertId;
+}
+
+/** Messages in the shape the dashboard thread expects (with the staff member's name). */
+async function getMessagesByIds(ids) {
+  if (!ids || !ids.length) return [];
+  return db.all(
+    `SELECT m.*, u.name AS staff_name
+       FROM messages m
+       LEFT JOIN staff_users u ON u.id = m.staff_id
+      WHERE m.id IN (?)
+      ORDER BY m.id`,
+    [ids]
+  );
+}
+
+/** A staff member answered from the dashboard: the bot steps back from this chat. */
+async function takeOverByStaff(phone, staffId) {
+  await db.run(
+    `UPDATE conversations
+        SET mode = 'human', human_since = UTC_TIMESTAMP(3),
+            assigned_to = COALESCE(assigned_to, ?)
+      WHERE phone = ? AND mode = 'bot'`,
+    [staffId || null, phone]
+  );
+}
+
+/**
  * Apply a delivery receipt from Meta (sent / delivered / read / failed).
  * Ticks only move forward (a late "delivered" never overwrites "read").
  * Meta can send the receipt a moment before our own insert finishes, so if
@@ -277,6 +330,9 @@ module.exports = {
   getConversation,
   recordIncoming,
   recordOutgoing,
+  recordOutgoingMedia,
+  getMessagesByIds,
+  takeOverByStaff,
   recordStaffEcho,
   applyStatusUpdate,
   markEscalated,

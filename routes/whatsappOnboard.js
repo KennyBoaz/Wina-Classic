@@ -179,10 +179,10 @@ function publicConnection(row) {
 async function applyStoredConnection() {
   try {
     const row = await db.one(
-      "SELECT phone_number_id, access_token FROM whatsapp_connection WHERE id = 1"
+      "SELECT phone_number_id, access_token, waba_id FROM whatsapp_connection WHERE id = 1"
     );
     if (row) {
-      whatsapp.setConnection({ token: row.access_token, phoneNumberId: row.phone_number_id });
+      whatsapp.setConnection({ token: row.access_token, phoneNumberId: row.phone_number_id, wabaId: row.waba_id });
       console.error(`[boot] WhatsApp connection loaded from the database (number id ${row.phone_number_id}).`);
     }
   } catch (err) {
@@ -347,7 +347,7 @@ router.post(
         now,
       ]
     );
-    whatsapp.setConnection({ token, phoneNumberId });
+    whatsapp.setConnection({ token, phoneNumberId, wabaId });
     step("Saved the connection - the bot now sends from this number", true);
 
     // 5) subscribe our app to this account's webhooks

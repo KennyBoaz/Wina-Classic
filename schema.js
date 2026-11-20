@@ -80,6 +80,11 @@ const COLUMNS = [
   ["messages", "starred", "TINYINT(1) NOT NULL DEFAULT 0"],
   ["messages", "reaction", "VARCHAR(16) NULL"],
   ["messages", "customer_reaction", "VARCHAR(16) NULL"],
+  // Phase 6: customer / staff files kept on disk by media.js
+  ["messages", "has_media", "TINYINT(1) NOT NULL DEFAULT 0"],
+  ["messages", "media_mime", "VARCHAR(100) NULL"],
+  ["messages", "media_name", "VARCHAR(255) NULL"],
+  ["messages", "media_size", "INT UNSIGNED NULL"],
   ["conversations", "pinned", "TINYINT(1) NOT NULL DEFAULT 0"],
 ];
 

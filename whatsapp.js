@@ -43,7 +43,7 @@ const SEND_ATTEMPTS = 2;
 const SAFE_RETRY_CODES = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"];
 
 const graph = axios.create({
-  baseURL: "https://graph.facebook.com",
+  baseURL: process.env.WHATSAPP_GRAPH_BASE || "https://graph.facebook.com",
   timeout: 15000,
   httpsAgent: new https.Agent({ keepAlive: true }),
   headers: { "Content-Type": "application/json" },
@@ -56,8 +56,13 @@ let runtimeConnection = null;
 function setConnection(conn) {
   runtimeConnection =
     conn && conn.token && conn.phoneNumberId
-      ? { token: conn.token, phoneNumberId: conn.phoneNumberId }
+      ? { token: conn.token, phoneNumberId: conn.phoneNumberId, wabaId: conn.wabaId || "" }
       : null;
+}
+
+/** The WhatsApp Business Account id (needed for message templates). */
+function getBusinessAccountId() {
+  return (runtimeConnection && runtimeConnection.wabaId) || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || "";
 }
 
 /** "database" (connected shop number), "env" (test number) or "none". */
@@ -128,6 +133,22 @@ function extractText(message) {
   }
 }
 
+const MEDIA_TYPES = new Set(["image", "audio", "video", "document", "sticker"]);
+
+/** The downloadable file attached to a message, or null. */
+function extractMedia(message) {
+  if (!message || !MEDIA_TYPES.has(message.type)) return null;
+  const part = message[message.type] || {};
+  if (!part.id) return null;
+  return {
+    id: part.id,
+    type: message.type,
+    mime: part.mime_type || null,
+    filename: part.filename || null,
+    caption: part.caption || null,
+  };
+}
+
 /**
  * Walk the nested Meta webhook body and return a flat list of incoming
  * customer messages. Delivery receipts are handled by parseStatusUpdates().
@@ -156,6 +177,8 @@ function parseIncomingMessages(body) {
           type: message.type,
           text: extractText(message),
           timestamp: message.timestamp,
+          // photo / voice note / video / document / sticker: { id, type, mime, filename, caption } or null
+          media: extractMedia(message),
           // the message this one is a reply to (WhatsApp "quote"), if any
           replyTo: (message.context && message.context.id) || null,
           // set when the customer reacted with an emoji to one of our messages
@@ -416,9 +439,204 @@ async function sendWhatsAppReaction(to, messageId, emoji) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Media (photos, voice notes, documents)
+// ---------------------------------------------------------------------------
+
+/**
+ * Download a customer's file. WhatsApp media links expire after a few minutes,
+ * so this is done as soon as the message arrives.
+ * @returns {Promise<{ buffer: Buffer, mime: string|null, size: number }>}
+ */
+async function downloadMedia(mediaId, { maxBytes = 16 * 1024 * 1024 } = {}) {
+  const { token } = getConfig();
+  const headers = { Authorization: `Bearer ${token}` };
+
+  const meta = await graph.get(`/${GRAPH_API_VERSION}/${encodeURIComponent(mediaId)}`, { headers });
+  const info = meta.data || {};
+  if (!info.url) throw new Error("WhatsApp did not return a download link for this file.");
+  if (Number(info.file_size) > maxBytes) {
+    const err = new Error(`file is too large (${info.file_size} bytes)`);
+    err.code = "TOO_LARGE";
+    throw err;
+  }
+
+  const file = await axios.get(info.url, {
+    headers,
+    responseType: "arraybuffer",
+    timeout: 30000,
+    maxContentLength: maxBytes,
+    maxBodyLength: maxBytes,
+  });
+  const buffer = Buffer.from(file.data);
+  const mime = info.mime_type || String(file.headers["content-type"] || "").split(";")[0] || null;
+  return { buffer, mime, size: buffer.length };
+}
+
+/** Upload a file to WhatsApp so it can be sent. Returns the media id. */
+async function uploadMedia(buffer, mime, filename) {
+  const { token, phoneNumberId } = getConfig();
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("type", mime);
+  form.append("file", new Blob([buffer], { type: mime }), filename || "file");
+
+  const base = process.env.WHATSAPP_GRAPH_BASE || "https://graph.facebook.com";
+  const res = await fetch(`${base}/${GRAPH_API_VERSION}/${phoneNumberId}/media`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+    signal: AbortSignal.timeout(60000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.id) {
+    const e = data && data.error;
+    const detail = e && e.error_data && e.error_data.details;
+    throw new Error(
+      e ? `${e.code ?? res.status}: ${e.message || "upload failed"}${detail ? " - " + detail : ""}` : `upload failed (HTTP ${res.status})`
+    );
+  }
+  return data.id;
+}
+
+/**
+ * Send an uploaded file to a customer.
+ * type: image | video | audio | document
+ * @returns {Promise<{ ok: boolean, id: string|null, error: string|null }>}
+ */
+async function sendWhatsAppMedia(to, { type, mediaId, caption, filename }) {
+  const { token, phoneNumberId } = getConfig();
+  const part = { id: mediaId };
+  if (caption && type !== "audio") part.caption = String(caption).slice(0, 1000);
+  if (type === "document" && filename) part.filename = filename;
+
+  try {
+    const response = await graph.post(
+      `/${GRAPH_API_VERSION}/${phoneNumberId}/messages`,
+      { messaging_product: "whatsapp", recipient_type: "individual", to, type, [type]: part },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    return { ok: true, id: response.data?.messages?.[0]?.id || null, error: null };
+  } catch (err) {
+    logWhatsAppError(err, to);
+    return { ok: false, id: null, error: describeSendError(err) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Message templates (the only thing WhatsApp allows after the 24-hour window)
+// ---------------------------------------------------------------------------
+
+/** All templates of the WhatsApp Business Account (every status). */
+async function fetchTemplates() {
+  const { token } = getConfig();
+  const waba = getBusinessAccountId();
+  if (!waba) {
+    const err = new Error("No WhatsApp Business Account id is set.");
+    err.code = "NO_WABA";
+    throw err;
+  }
+  const headers = { Authorization: `Bearer ${token}` };
+  let url = `/${GRAPH_API_VERSION}/${waba}/message_templates`;
+  let params = { fields: "name,language,status,category,parameter_format,components", limit: 100 };
+  const all = [];
+  for (let page = 0; page < 5 && url; page += 1) {
+    const response = await graph.get(url, { headers, params });
+    all.push(...((response.data && response.data.data) || []));
+    url = (response.data && response.data.paging && response.data.paging.next) || null;
+    params = undefined; // the "next" link already carries them
+  }
+  return all;
+}
+
+/**
+ * Boil one Meta template down to what the dashboard needs.
+ * "supported" = it only needs plain text values for {{1}}, {{2}}... in its body.
+ * Templates with a photo/video/document header, a variable in the header, named
+ * variables or buttons with variables need more than this screen can fill in.
+ */
+function summariseTemplate(t) {
+  const comps = Array.isArray(t.components) ? t.components : [];
+  const find = (type) => comps.find((c) => String(c.type).toUpperCase() === type);
+  const header = find("HEADER");
+  const body = find("BODY");
+  const footer = find("FOOTER");
+  const buttons = find("BUTTONS");
+
+  const bodyText = (body && body.text) || "";
+  const numbers = Array.from(bodyText.matchAll(/\{\{\s*(\d+)\s*\}\}/g)).map((m) => Number(m[1]));
+  const variables = numbers.length ? Math.max(...numbers) : 0;
+
+  let supported = true;
+  let reason = "";
+  const no = (why) => { if (supported) { supported = false; reason = why; } };
+
+  if (String(t.parameter_format || "").toUpperCase() === "NAMED" || /\{\{\s*[A-Za-z_]/.test(bodyText)) no("named variables");
+  const unique = Array.from(new Set(numbers)).sort((a, b) => a - b);
+  if (unique.some((n, i) => n !== i + 1)) no("variables are not numbered 1, 2, 3...");
+  if (header) {
+    const format = String(header.format || "TEXT").toUpperCase();
+    if (format !== "TEXT") no("it has a " + format.toLowerCase() + " header");
+    else if (/\{\{/.test(header.text || "")) no("its header has a variable");
+  }
+  if (buttons && Array.isArray(buttons.buttons)) {
+    for (const b of buttons.buttons) {
+      const kind = String(b.type || "").toUpperCase();
+      if (["COPY_CODE", "FLOW", "OTP", "MPM", "CATALOG", "SPM"].includes(kind) || /\{\{/.test(b.url || "")) {
+        no("it has a button that needs extra data");
+        break;
+      }
+    }
+  }
+
+  return {
+    name: t.name,
+    language: t.language,
+    category: t.category || null,
+    variables,
+    body: bodyText,
+    header: header && String(header.format || "TEXT").toUpperCase() === "TEXT" ? header.text || "" : "",
+    footer: (footer && footer.text) || "",
+    supported,
+    reason,
+  };
+}
+
+/**
+ * Send an approved template. params fill {{1}}, {{2}}... in the body.
+ * @returns {Promise<{ ok: boolean, id: string|null, error: string|null }>}
+ */
+async function sendWhatsAppTemplate(to, { name, language, params = [] }) {
+  const { token, phoneNumberId } = getConfig();
+  const template = { name, language: { code: language } };
+  if (params.length) {
+    template.components = [{ type: "body", parameters: params.map((text) => ({ type: "text", text: String(text) })) }];
+  }
+  try {
+    const response = await graph.post(
+      `/${GRAPH_API_VERSION}/${phoneNumberId}/messages`,
+      { messaging_product: "whatsapp", recipient_type: "individual", to, type: "template", template },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    return { ok: true, id: response.data?.messages?.[0]?.id || null, error: null };
+  } catch (err) {
+    logWhatsAppError(err, to);
+    return { ok: false, id: null, error: describeSendError(err) };
+  }
+}
+
 module.exports = {
   setConnection,
   getConnectionSource,
+  getBusinessAccountId,
+  downloadMedia,
+  uploadMedia,
+  sendWhatsAppMedia,
+  fetchTemplates,
+  summariseTemplate,
+  sendWhatsAppTemplate,
+  extractMedia,
+  describeSendError,
   sendWhatsAppReaction,
   parseIncomingMessages,
   parseStatusUpdates,

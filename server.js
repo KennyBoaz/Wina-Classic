@@ -9,6 +9,12 @@
  * Meta retries the webhook if we take more than a few seconds, so we send
  * HTTP 200 immediately and process the message in the background.
  *
+ * PHASE 6 (media, templates, alerts)
+ * ---------------------------------
+ * - media.js stores customer/staff files privately; routes/mediaTemplates.js serves them
+ *   (logged-in only), sends staff files and templates, and adds file details to message lists.
+ * - alerts.js emails / texts the team when nobody has the dashboard open.
+ *
  * CHANGES FOR COEXISTENCE (connecting the shop's real WhatsApp number)
  * --------------------------------------------------------------------
  * - /api/whatsapp/*              admin API used by the Connect WhatsApp page
@@ -57,6 +63,7 @@ const { ensureSchema } = require("./schema.js");
 const path = require("path");
 const { createApiRouter } = require("./routes/index.js");
 const whatsappOnboard = require("./routes/whatsappOnboard.js");
+const mediaTemplates = require("./routes/mediaTemplates.js");
 
 const VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 
@@ -226,6 +233,9 @@ router.get("/admin/connect-whatsapp.html", connectPageHeaders, (_req, res) => {
 
 // Must come BEFORE the general /api router below.
 router.use("/api/whatsapp", whatsappOnboard.router);
+
+// Phase 6: files, templates, alert test (also adds file details to message lists).
+router.use("/api", mediaTemplates.router);
 
 router.use("/api", createApiRouter());
 router.use("/admin", adminHeaders, express.static(path.join(__dirname, "public", "admin")));
