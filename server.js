@@ -442,6 +442,7 @@ async function handleIncomingMessage(message) {
   // Save the customer's message first. This also tells us if it is a
   // duplicate and whether a staff member has taken over this chat.
   let conversation = null;
+  let savedMessageId = null;
   try {
     const saved = await chatStore.recordIncoming(message);
     if (saved.duplicate) {
@@ -450,11 +451,7 @@ async function handleIncomingMessage(message) {
       return;
     }
     conversation = saved.conversation;
-    // a photo / voice note / document: download it now (WhatsApp links expire) and keep it privately
-    if (message.media && saved.messageId) {
-      mediaStore.attach(saved.messageId, from, message.media).catch((err) =>
-        console.error("[media] Could not save the customer's file:", err.message));
-    }
+    savedMessageId = saved.messageId || null;
   } catch (err) {
     console.error(
       "[db] Could not save the incoming message. The bot will still reply:",
@@ -467,6 +464,24 @@ async function handleIncomingMessage(message) {
       conversation ? conversation.mode : "UNKNOWN - database problem"
     })`
   );
+
+  // A photo / voice note / document: download it now (WhatsApp links expire) and keep it
+  // privately for the dashboard. A photo or PDF is also shown to Gemini for this one reply.
+  let attachments = [];
+  if (message.media && savedMessageId) {
+    try {
+      const kept = await mediaStore.attach(savedMessageId, from, message.media);
+      if (kept) {
+        trace(id, `2b file kept (${kept.mime}, ${kept.size} bytes)`);
+        if (mediaStore.canShowToAi(kept)) {
+          attachments = [{ mimeType: kept.mime, data: kept.buffer.toString("base64") }];
+        }
+      }
+    } catch (err) {
+      console.error("[media] Could not save the customer's file:", err.message);
+      trace(id, `2b file could not be kept (${err.message})`);
+    }
+  }
 
   // HUMAN MODE: staff are handling this customer. Saved, but no AI reply.
   if (conversation && conversation.mode === "human") {
@@ -507,6 +522,7 @@ async function handleIncomingMessage(message) {
         history,
         phone: from,
         customerName: name,
+        attachments,
       }),
       GEMINI_STEP_TIMEOUT_MS,
       "Gemini step"

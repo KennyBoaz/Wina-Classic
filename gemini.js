@@ -6,31 +6,34 @@
  *
  * Package: @google/genai
  *
- * WHAT CHANGED IN THIS VERSION (speed fixes)
- * ------------------------------------------
- * 1. Request timeout: a hung/overloaded model call now gives up after
- *    REQUEST_TIMEOUT_MS instead of waiting a minute or more.
- * 2. Model health memory: when a model fails (503 / 429 / timeout) it is
- *    marked "down" for COOLDOWN_MS, and later messages skip it and go
- *    straight to a healthy model. Before, EVERY message re-tried the broken
- *    primary model first and paid the full delay again.
- * 3. Fewer retries (2 per model instead of 3) with a shorter backoff.
- * 4. One shared Gemini client (reuses connections) instead of a new one
- *    per message.
- * 5. Timing logs so you can see exactly where the seconds go.
- * 6. Optional GEMINI_THINKING_LEVEL env var to cut "thinking" time.
+ * WHAT CHANGED IN THIS VERSION
+ * ----------------------------
+ * A. NO MORE "THINKING OUT LOUD" IN REPLIES
+ *    The model sometimes wrote its planning ("Now let's reply warmly to Kenny...")
+ *    in front of the real message, and customers saw it. Now:
+ *      - the model is told to put the customer's message inside <reply> tags;
+ *      - only what is inside the tags is sent (planning outside is thrown away);
+ *      - if the tags are missing, a filter removes obvious planning sentences;
+ *      - saved chat history is cleaned the same way, so old leaked turns stop
+ *        teaching the model to do it again.
+ * B. THE BOT CAN SEE PHOTOS AND PDFs
+ *    generateReply() accepts attachments [{ mimeType, data (base64) }]. They are
+ *    shown to Gemini for THIS reply only and are never saved in the chat history
+ *    (history keeps just the text), so the history stays small.
+ *
+ * (Earlier changes, still here: request timeout, model health memory with
+ * cooldown, fewer retries, one shared client, timing logs, optional
+ * GEMINI_THINKING_LEVEL.)
  *
  * ENV VARS
  * --------
  *   GEMINI_API_KEY            required
  *   GEMINI_MODEL              primary model   (default: gemini-3.7-flash)
  *   GEMINI_FALLBACK_MODEL     fallback model  (default: gemini-3.8-flash)
- *   GEMINI_TIMEOUT_MS         per-request timeout   (default: 12000)
+ *   GEMINI_TIMEOUT_MS         per-request timeout   (default: 30000)
  *   GEMINI_COOLDOWN_MS        how long a failing model is skipped (default: 300000 = 5 min)
  *   GEMINI_THINKING_LEVEL     optional, e.g. "low" or "minimal". Leave unset to use the default.
  *
- * NOTE: if your .env / cPanel environment already sets GEMINI_MODEL, those
- * values override the defaults above. Update them there too.
  * Confirm model names at https://ai.google.dev/gemini-api/docs/models
  */
 
@@ -125,10 +128,12 @@ function orderedModels() {
 function buildExtraRules() {
   const lines = [
     "ADDITIONAL RULES (these take priority over anything above)",
+    "- OUTPUT FORMAT: write ONLY the message the customer will read, inside <reply> and </reply> tags, like <reply>Hello!</reply>. Put nothing outside the tags: no planning, no notes to yourself, no description of what you are about to say. The customer never sees your thinking.",
     `- Opening hours: ${describeHours()} (Africa/Kampala). Use exactly these if a customer asks.`,
     "- Prices and stock: when a customer asks about a specific item, brand, price or availability, call search_products first and quote ONLY the prices and stock it returns. If nothing is found, never guess: say you will check with the team and call log_inquiry with follow_up_needed true.",
     "- Appointments: call check_availability for the date before offering times and offer only the slots it returns. Call book_appointment only after the customer confirms a slot. If booking fails, offer the alternative slots it returns. Dates must be YYYY-MM-DD.",
     "- Interest without an order: when a customer shows interest in a product, occasion, price or visit but is not ordering or booking, call log_inquiry quietly (follow_up_needed true if the team should contact them), then carry on helping. Never mention that you logged it.",
+    "- Photos and files: a message like [Customer sent a image: ...] means the customer sent a photo. If the photo or PDF is attached to this message, look at it and use what you see (for example an event invitation, a colour, an outfit). Never claim you saw something you cannot see. For voice notes, videos or files you cannot open, say so briefly, ask the customer to type what they need, or offer to connect them with a team member.",
   ];
   if (process.env.DELIVERY_INFO) lines.push(`- Delivery: ${process.env.DELIVERY_INFO}`);
   if (process.env.PAYMENT_INFO) lines.push(`- Payment: ${process.env.PAYMENT_INFO}`);
@@ -207,6 +212,108 @@ function normalizeArgs(args) {
     }
   }
   return args;
+}
+
+// ---------------------------------------------------------------------------
+// Keeping the model's planning out of the customer's chat
+// ---------------------------------------------------------------------------
+
+// A sentence that starts like this is the model talking to itself, not to the customer.
+const PLANNING_START = [
+  /^(?:(?:now|next|okay|ok|so),?\s*)?let'?s\s+(?:acknowledge|reply|respond|give|confirm|ask|reassure|thank|greet|keep|be|warmly|politely|write|draft|say|send)\b/i,
+  /^(?:(?:now|next|okay|ok|so),?\s*)?(?:the\s+)?(?:customer|user)\b/i,
+  /^(?:(?:now|next|okay|ok|so),?\s*)?i\s+(?:should|need to|will|must)\s+(?:reply|respond|acknowledge|ask|confirm|greet|thank|keep)\b/i,
+  /^keep it (?:short|brief|natural)\b/i,
+];
+// ...and these give a sentence away wherever they appear in it.
+const PLANNING_ANYWHERE = /\blet'?s\s+(?:acknowledge|reply|respond|give|confirm|ask|reassure|thank|greet|keep|be|warmly|politely)\b|\bkeep it (?:short|brief|natural)\b|\b1-2 sentences\b|\bthe customer\b/i;
+
+/**
+ * Removes planning sentences the model wrote in front of its real message.
+ * It only acts when the text STARTS like planning, so ordinary replies pass
+ * through untouched. The planning and the reply are often glued together with
+ * no space ("...natural.Hello Kenny!"), so that is used as a split point too.
+ */
+function stripPlanning(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return raw;
+
+  const starts = [0];
+  const re = /(?<=[.!?)"\u201d])(?=[A-Z])|\n{2,}/g;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    if (m[0] === "") re.lastIndex += 1;           // zero-width match: step forward
+    starts.push(m.index + m[0].length);
+  }
+  const segments = starts.map((start, i) => raw.slice(start, starts[i + 1] ?? raw.length).trim());
+
+  if (segments.length < 2 || !PLANNING_START.some((rx) => rx.test(segments[0]))) return raw;
+
+  let i = 0;
+  while (i < segments.length - 1 && (i === 0 || PLANNING_ANYWHERE.test(segments[i]))) i += 1;
+
+  const cleaned = raw.slice(starts[i]).trim();
+  return cleaned || raw;
+}
+
+/** The text the customer should get from one raw model answer. */
+function extractReply(raw) {
+  const text = String(raw || "");
+
+  const closed = text.match(/<reply>([\s\S]*?)<\/reply>/i);
+  if (closed && closed[1].trim()) return closed[1].trim();
+
+  const open = text.match(/<reply>([\s\S]*)$/i);          // closing tag missing
+  if (open && open[1].trim()) return open[1].trim();
+
+  return stripPlanning(text.replace(/<\/?reply>/gi, ""));
+}
+
+const hasToolPart = (entry) =>
+  (entry.parts || []).some((p) => p && (p.functionCall || p.functionResponse));
+
+function entryText(entry) {
+  if (typeof entry.content === "string" && entry.content) return entry.content;
+  return (entry.parts || []).filter((p) => p && p.text && !p.thought).map((p) => p.text).join("\n");
+}
+
+function setEntryText(entry, text) {
+  entry.content = text;
+  entry.parts = [{ text }];
+}
+
+/**
+ * Cleans one saved turn from the database. Plain model answers get their
+ * planning removed and are stored in the <reply> format, so the model keeps
+ * seeing the pattern it is supposed to follow.
+ */
+function cleanStoredTurn(entry) {
+  if (!entry || entry.role !== "model" || hasToolPart(entry)) return entry;
+  const text = entryText(entry);
+  if (!text) return entry;
+  const clean = extractReply(text);
+  const wanted = `<reply>${clean}</reply>`;
+  if (wanted === text) return entry;
+  return { ...entry, content: wanted, parts: [{ text: wanted }] };
+}
+
+/**
+ * History to save after a turn: photos are removed (only their text stays),
+ * and the final model answer is stored as the clean reply.
+ */
+function tidyHistory(entries, reply) {
+  const out = (entries || []).map((entry) => {
+    if (!entry || !Array.isArray(entry.parts)) return entry;
+    return { ...entry, parts: entry.parts.filter((p) => !(p && (p.inlineData || p.fileData))) };
+  });
+
+  if (reply) {
+    const last = out[out.length - 1];
+    if (last && last.role === "model" && !hasToolPart(last)) {
+      setEntryText(last, `<reply>${reply}</reply>`);
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -319,13 +426,16 @@ async function sendResilient({ ai, models, chat, history, config, messageOrParts
 /**
  * Run one customer turn through Gemini, including the function-calling loop.
  *
+ * @param {object}  args
+ * @param {Array}   [args.attachments]  photos / PDFs for THIS reply: [{ mimeType, data (base64) }]
  * @returns {Promise<{ reply: string, updatedHistory: Array, rateLimited: boolean }>}
  */
-async function generateReply({ userMessage, history, phone, customerName }) {
+async function generateReply({ userMessage, history, phone, customerName, attachments = [] }) {
   const turnStartedAt = Date.now();
   const ai = getClient();
   const config = buildChatConfig({ phone, customerName });
-  const seedHistory = toGeminiHistory(history || []);
+  // Old turns may contain leaked planning from before this fix: clean them as they load.
+  const seedHistory = toGeminiHistory((history || []).map(cleanStoredTurn));
 
   // Healthy models first. Narrowed after a fallback so later calls in this
   // turn keep using whichever model actually answered.
@@ -338,19 +448,37 @@ async function generateReply({ userMessage, history, phone, customerName }) {
   });
 
   console.log(
-    `[gemini] Sending turn for ${phone}. Model order: ${models.join(" -> ")}`
+    `[gemini] Sending turn for ${phone}. Model order: ${models.join(" -> ")}` +
+      (attachments.length ? ` (with ${attachments.length} attachment(s))` : "")
   );
+
+  // Photos go first, then the text (Google's recommendation for a single image).
+  const withFiles = attachments.length
+    ? [
+        ...attachments.map((a) => ({ inlineData: { mimeType: a.mimeType, data: a.data } })),
+        { text: userMessage },
+      ]
+    : userMessage;
 
   let response;
   try {
-    const result = await sendResilient({
-      ai,
-      models,
-      chat,
-      history: seedHistory,
-      config,
-      messageOrParts: userMessage,
-    });
+    let result;
+    try {
+      result = await sendResilient({
+        ai, models, chat, history: seedHistory, config, messageOrParts: withFiles,
+      });
+    } catch (err) {
+      // If the photo itself was refused (not a rate limit or outage), answer without it.
+      if (attachments.length && !isRateLimitError(err) && !isRetryableServerError(err)) {
+        console.warn(`[gemini] The attachment was refused (${String(err.message || "").slice(0, 120)}). Answering without it.`);
+        chat = ai.chats.create({ model: models[0], history: seedHistory, config });
+        result = await sendResilient({
+          ai, models, chat, history: seedHistory, config, messageOrParts: userMessage,
+        });
+      } else {
+        throw err;
+      }
+    }
     response = result.response;
     chat = result.chat;
     models = models.slice(models.indexOf(result.model));
@@ -368,8 +496,12 @@ async function generateReply({ userMessage, history, phone, customerName }) {
         console.warn(`[gemini] Unusual finishReason: ${finishReason}`);
       }
 
-      const reply = getText(response);
-      const updatedHistory = fromGeminiHistory(chat.getHistory());
+      const rawText = getText(response);
+      const reply = extractReply(rawText);
+      if (rawText && reply !== rawText.trim() && !/<reply>/i.test(rawText)) {
+        console.warn("[gemini] The model skipped the <reply> tags; planning text was filtered out.");
+      }
+      const updatedHistory = tidyHistory(fromGeminiHistory(chat.getHistory()), reply);
       console.log(
         `[timing] Gemini turn finished in ${Date.now() - turnStartedAt}ms (${round - 1} tool round(s)).`
       );
@@ -431,7 +563,7 @@ async function generateReply({ userMessage, history, phone, customerName }) {
   console.warn(
     `[gemini] Stopped after ${MAX_TOOL_ROUNDS} tool rounds to avoid an infinite loop.`
   );
-  const updatedHistory = fromGeminiHistory(chat.getHistory());
+  const updatedHistory = tidyHistory(fromGeminiHistory(chat.getHistory()), null);
   return {
     reply:
       "I need to check on that with the team. Someone will follow up with you shortly.",
@@ -447,7 +579,7 @@ async function generateReply({ userMessage, history, phone, customerName }) {
 function withFallbackTurn(history, userMessage, reply) {
   const now = new Date().toISOString();
   return [
-    ...(history || []),
+    ...(history || []).map(cleanStoredTurn),
     {
       role: "user",
       content: userMessage,
@@ -456,8 +588,8 @@ function withFallbackTurn(history, userMessage, reply) {
     },
     {
       role: "model",
-      content: reply,
-      parts: [{ text: reply }],
+      content: `<reply>${reply}</reply>`,
+      parts: [{ text: `<reply>${reply}</reply>` }],
       timestamp: now,
     },
   ];
@@ -497,4 +629,4 @@ function handleGeminiError(err, history, userMessage) {
   };
 }
 
-module.exports = { generateReply };
+module.exports = { generateReply, extractReply, stripPlanning, cleanStoredTurn, tidyHistory };

@@ -209,6 +209,9 @@ async function sendEmail({ host, port, secure, user, pass, from, to, rejectUnaut
   const opts = { host, port, secure, rejectUnauthorized };
   const conn = makeConnection(await openSocket(opts), opts);
   const me = os.hostname() || "localhost";
+  // A mail server that goes quiet must not leave this hanging (and holding a socket) forever.
+  // Closing the connection makes every pending read fail at once.
+  const watchdog = setTimeout(() => conn.close(), 45000);
   try {
     expect(await conn.read(), 220);
     expect(await conn.cmd(`EHLO ${me}`), 250);
@@ -239,6 +242,7 @@ async function sendEmail({ host, port, secure, user, pass, from, to, rejectUnaut
     expect(await conn.read(), 250);
     conn.send("QUIT");
   } finally {
+    clearTimeout(watchdog);
     conn.close();
   }
 }

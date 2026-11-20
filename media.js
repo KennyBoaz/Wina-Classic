@@ -111,7 +111,7 @@ async function save(messageId, buffer) {
  * Throws on failure (server.js logs it); the chat keeps working without the file.
  */
 async function attach(messageId, phone, media) {
-  if (!media || !media.id) return false;
+  if (!media || !media.id) return null;
 
   let got;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -134,7 +134,18 @@ async function attach(messageId, phone, media) {
     [mime, cleanName(media.filename, defaultName(media.type, mime)), got.size, messageId]
   );
   console.error(`[media] Saved ${mime} (${got.size} bytes) for message ${messageId} from ${phone}.`);
-  return true;
+  // handed back so the bot can look at a photo / PDF without downloading it again
+  return { mime, size: got.size, buffer: got.buffer };
+}
+
+// What the AI is allowed to look at: photos and PDFs, small enough to send in one request.
+const AI_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "application/pdf"]);
+const AI_MAX_BYTES = Math.max(1, Number(process.env.GEMINI_MAX_ATTACHMENT_MB) || 4) * 1024 * 1024;
+
+/** Should this kept file be shown to Gemini? Switch off with GEMINI_SEE_MEDIA=false. */
+function canShowToAi(kept) {
+  if (/^(false|0|no|off)$/i.test(String(process.env.GEMINI_SEE_MEDIA || ""))) return false;
+  return Boolean(kept && AI_MIMES.has(kept.mime) && kept.size <= AI_MAX_BYTES);
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +216,7 @@ module.exports = {
   pathFor,
   save,
   attach,
+  canShowToAi,
   cleanupOnce,
   startCleanup,
 };
